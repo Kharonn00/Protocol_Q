@@ -1,0 +1,42 @@
+# Git
+.git/
+.gitignore
+
+# Environment Variables & Secrets
+.env
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+kalshi-key.pem
+
+# Python & Build Cache
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyc
+*.whl
+*.egg-info/
+target/
+CACHEDIR.TAG
+
+# Virtual Environments
+.venv/
+venv/
+env/
+
+# Local Logs & Trading Data (CRITICAL TO IGNORE)
+trades.jsonl
+*.log
+
+# IDE Configurations
+.idea/
+.vscode/
+
+# Documentation
+README*
+*.md
+
+# Gemini CLI
+GEMINI.md

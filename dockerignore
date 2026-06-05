@@ -1,0 +1,25 @@
+.git/
+.gitignore
+.env
+*.env
+target/
+__pycache__/
+*.py[cod]
+*.pyd
+*.dll
+*.egg-info/
+.venv/
+venv/
+.idea/
+.vscode/
+README*
+*.md
+*.whl
+CACHEDIR.TAG
+
+# Private keys
+*.pem
+*.key
+*.p12
+*.pfx
+kalshi-key.pem

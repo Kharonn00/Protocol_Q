@@ -1,0 +1,13 @@
+[package]
+name = "kalshi_bot"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[lib]
+name = "kalshi_bot"
+crate-type = ["cdylib"]
+
+[dependencies]
+# C-2 FIX: Aligned explicitly to match Cargo.lock
+pyo3 = { version = "0.28", features = ["extension-module"] }
