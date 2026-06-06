@@ -1,9 +1,11 @@
 # ==========================================
-# STAGE 1: The Builder
+# STAGE 1: The Builder (Secure & Explicit)
 # ==========================================
 FROM python:3.12-slim AS builder
 
-RUN apt-get update && apt-get install -y gcc build-essential
+# SECURITY: Clean apt cache immediately to reduce attack surface and layer size
+RUN apt-get update && apt-get install -y --no-install-recommends gcc build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create a virtual environment to hold dependencies securely
 RUN python -m venv /opt/venv
@@ -19,7 +21,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ==========================================
 FROM python:3.12-slim
 
-# Copy the completely built virtual environment from Stage 1
+# Copy the completely built virtual environment from Stage 1 (Standardized on 3.12 ABI)
 COPY --from=builder /opt/venv /opt/venv
 
 # Force the container to use the virtual environment's Python and libraries
@@ -33,8 +35,8 @@ COPY kalshi_main.py .
 RUN useradd -m botuser && chown -R botuser:botuser /app
 USER botuser
 
-# SECURITY: Healthcheck perfectly synchronized with Python's static heartbeat file
+# SECURITY: Healthcheck dynamically scans for secure randomized temp files [3]
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD python -c "import os, time; f='/tmp/kalshi_heartbeat.tick'; exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f) < 120 else 1)"
+  CMD python -c "import os, glob, time; ticks = glob.glob('/tmp/kalshi_heartbeat_*.tick'); exit(0 if ticks and any(time.time() - os.path.getmtime(t) < 120 for t in ticks) else 1)"
 
 CMD ["python", "kalshi_main.py"]
