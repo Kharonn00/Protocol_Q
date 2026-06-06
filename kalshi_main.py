@@ -16,6 +16,7 @@ import ctypes
 import atexit
 import datetime
 import collections
+import tempfile
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 from abc import ABC, abstractmethod
@@ -44,14 +45,16 @@ class BotConfig:
     
     # Structurally safe defaults via environment variables (Twelve-Factor App Compliant)
     DRAWDOWN_LIMIT_PCT: float = float(os.environ.get("DRAWDOWN_LIMIT_PCT", "0.20"))
-    MIN_EDGE_REQUIREMENT: float = 0.04
-    MIN_PROBABILITY_THRESHOLD: float = 0.55
     STALE_BALANCE_TIMEOUT_SEC: float = 120.0
     L2_MAX_DEPTH_PCT: float = 0.05
     
-    # --- SAST & ARCHITECTURE FIXES ---
     BINANCE_LIQUIDATION_THRESHOLD: float = float(os.environ.get("BINANCE_LIQ_THRESHOLD", "1500000.0"))
     MAX_ALLOWED_SPREAD: float = float(os.environ.get("MAX_ALLOWED_SPREAD", "0.25"))
+
+    # --- MEAN REVERSION CONFIGURATION ---
+    Z_SCORE_THRESHOLD: float = float(os.environ.get("Z_SCORE_THRESHOLD", "2.5"))
+    MIN_WELFORD_TICKS: int = int(os.environ.get("MIN_WELFORD_TICKS", "100"))
+    MAX_FADE_PRICE: float = float(os.environ.get("MAX_FADE_PRICE", "0.45"))
 
 config = BotConfig()
 
@@ -66,34 +69,34 @@ class TickData(BaseModel):
 class BinanceOrderDetails(BaseModel):
     s: str      # Symbol (e.g., BTCUSDT)
     S: str      # Side: "BUY" (short liq) or "SELL" (long liq)
-    q: float    # Original quantity
-    p: float    # Order price
+    q: float = Field(..., gt=0)  # SAST FIX: Strict Lower Bound
+    p: float = Field(..., gt=0)  # SAST FIX: Strict Lower Bound
 
 class BinancePayload(BaseModel):
     e: str
     o: BinanceOrderDetails
 
 # ==========================================
-# STATE MANAGEMENT
+# STATE MANAGEMENT (Strict O(1) Memory)
 # ==========================================
 class AssetState:
     def __init__(self):
-        # 1. Terminal Delta EWMA State
-        self.history = collections.deque([15.0] * 10, maxlen=10)
-        self.last_seen_contract_id: str = ""
-        self.period_open_price: float = 0.0
-        
         self.active_contract_id: str = ""
         self.strike_price: float = 0.0
         self.expiration_time: float = 0.0  
         self.last_price: Optional[float] = None
         self.cooldown_until: float = 0.0
+        self.last_seen_contract_id: str = ""
 
-        # 2. Implied Volatility (IV) State
-        self.implied_volatility: float = 0.0
-        self.last_iv_update_time: float = 0.0
+        # 1. Welford Online Algorithm State (O(1) Variance)
+        self.welford_count: int = 0
+        self.welford_mean: float = 0.0
+        self.welford_m2: float = 0.0
+        
+        # 2. Recursive EMA Baseline State (O(1) Anchor)
+        self.ewma_price: float = 0.0
 
-        # 3. L2 Orderbook State (Strictly O(1) Bounded)
+        # 3. L2 Orderbook State
         self.bids: Dict[float, float] = {}
         self.asks: Dict[float, float] = {}
         
@@ -434,7 +437,7 @@ class LiveKalshiBroker(ExecutionBroker):
                     orders = data.get("orders", [])
                     if orders: return orders[0] 
         except Exception as e: 
-            logger.error(f"Error fetching order by client ID {client_order_id}", exc_info=True)
+            logger.error(f"Error fetching order by client ID {client_order_id[:20]}...", exc_info=True)  # SAST FIX: Cardinality noise reduction
         return {}
 
     async def cancel_order(self, order_id: str) -> bool:
@@ -511,7 +514,8 @@ class LiveKalshiBroker(ExecutionBroker):
                         err_msg = err_json.get("error", {}).get("message", "Unknown API error")
                     except Exception:
                         err_msg = "Could not parse JSON error response."
-                    logger.error(f"[API ERROR] Trade rejected (HTTP {response.status}): {err_msg}")
+                    # SAST FIX: Truncate external API error payloads to prevent log bloat / buffer exhaustion
+                    logger.error(f"[API ERROR] Trade rejected (HTTP {response.status}): {str(err_msg)[:250]}")
                     return None
         except Exception as e: 
             logger.error("Error executing trade", exc_info=True)
@@ -530,7 +534,7 @@ class LiveTradingEngine:
         self.last_sync_time: float = 0.0
         
         self.active_trade_count: int = 0
-        self._binance_events_received: int = 0  # SAST FIX: Observability Counter
+        self._binance_events_received: int = 0 
         self.shutting_down: bool = False
         
         self.balance_lock = asyncio.Lock() 
@@ -544,26 +548,17 @@ class LiveTradingEngine:
         self._pending_tasks = set()
 
         if sys.platform != 'win32':
-            self.heartbeat_file = f"/tmp/kalshi_heartbeat_{os.getpid()}.tick"
-            try: 
-                open(self.heartbeat_file, 'a').close()
-            except Exception: pass
-            atexit.register(lambda: os.remove(self.heartbeat_file) if os.path.exists(self.heartbeat_file) else None)
-
-    def _write_audit_log(self, contract_id: str, side: str, limit_price: float, quantity: int, order_id: str):
-        log_entry = {
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "contract_id": contract_id,
-            "side": side,
-            "price": limit_price,
-            "quantity": quantity,
-            "order_id": order_id
-        }
-        try:
-            with open("trades.jsonl", "a") as f:
-                f.write(json.dumps(log_entry) + "\n")
-        except Exception:
-            logger.error("Failed to write audit log", exc_info=True)
+            # SAST FIX: Cryptographically secure, un-guessable temp file creation
+            fd, self.heartbeat_file = tempfile.mkstemp(prefix="kalshi_heartbeat_", suffix=".tick")
+            os.close(fd)
+                
+            def cleanup_heartbeat(path):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except Exception as e:
+                    logger.warning(f"Failed to remove heartbeat file: {e}")
+            atexit.register(cleanup_heartbeat, self.heartbeat_file)
 
     def _get_filled_qty_from_details(self, details: dict, requested_qty: int) -> int:
         maker_fill = details.get("maker_fill_count", 0)
@@ -627,7 +622,9 @@ class LiveTradingEngine:
                         self.starting_balance = self.available_balance
                     
                     if self.starting_balance > 0:
-                        drawdown = (self.starting_balance - self.available_balance) / self.starting_balance
+                        # SAST FIX: Apples-to-Apples total balance calculation
+                        total_balance = self.available_balance + self.capital_in_flight
+                        drawdown = (self.starting_balance - total_balance) / self.starting_balance
                         if drawdown >= config.DRAWDOWN_LIMIT_PCT:
                             logger.critical(f"DRAWDOWN LIMIT REACHED ({drawdown*100:.1f}%). Halting operations.")
                             self.shutting_down = True
@@ -658,27 +655,6 @@ class LiveTradingEngine:
                     state.strike_price = strike
                     state.expiration_time = exp_time 
             await asyncio.sleep(30)
-
-    async def sync_implied_volatility_loop(self):
-        timeout = aiohttp.ClientTimeout(total=5.0)
-        urls = {
-            "BTC-USD": "https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_dvol",
-            "ETH-USD": "https://www.deribit.com/api/v2/public/get_index_price?index_name=eth_dvol"
-        }
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            while not self.shutting_down:
-                for symbol, url in urls.items():
-                    try:
-                        async with session.get(url) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                iv_val = float(data.get("result", {}).get("index_price", 0.0))
-                                if 5.0 < iv_val < 300.0:
-                                    self.assets[symbol].implied_volatility = iv_val
-                                    self.assets[symbol].last_iv_update_time = time.time()
-                    except Exception as e:
-                        logger.warning(f"IV fetch failed for {symbol}; falling back to EWMA", exc_info=True)
-                await asyncio.sleep(10.0) 
 
     async def execute_and_hold_entry(self, state: AssetState, contract_id: str, side: str, limit_price: float, quantity: int, total_cost: float, seconds_left: float):
         client_entry_oid = f"entry-{contract_id}-{uuid.uuid4().hex}"
@@ -723,7 +699,6 @@ class LiveTradingEngine:
                         refund = unfilled_qty * limit_price
                         async with self.balance_lock:
                             self.capital_in_flight = max(0.0, self.capital_in_flight - refund)
-                            # FIX: Completely restore capital to the active wallet on partial miss
                             self.available_balance += refund
                             
                             state.position_size -= unfilled_qty
@@ -735,8 +710,6 @@ class LiveTradingEngine:
                     else:
                         logger.info(f"[{contract_id}] Order perfectly filled ({filled_qty}/{quantity}).")
 
-                    self._write_audit_log(contract_id, side, limit_price, filled_qty, order_id)
-
                     async with self.balance_lock:
                         self.capital_in_flight = max(0.0, self.capital_in_flight - locked_capital)
                     
@@ -747,7 +720,6 @@ class LiveTradingEngine:
                     await self.broker.cancel_order(order_id)
                     async with self.balance_lock:
                         self.capital_in_flight = max(0.0, self.capital_in_flight - locked_capital)
-                        # FIX: Completely restore capital to the active wallet on total miss
                         self.available_balance += locked_capital
                         
                         state.position_size -= quantity
@@ -765,7 +737,6 @@ class LiveTradingEngine:
                 logger.critical(f"[{contract_id}] API Execution dropped. Releasing slot natively.")
                 async with self.balance_lock:
                     self.capital_in_flight = max(0.0, self.capital_in_flight - locked_capital)
-                    # FIX: Completely restore capital to the active wallet on API drop
                     self.available_balance += locked_capital
                     
                     state.position_size -= quantity
@@ -778,7 +749,6 @@ class LiveTradingEngine:
             if locked_capital > 0:
                 async with self.balance_lock:
                     self.capital_in_flight = max(0.0, self.capital_in_flight - locked_capital)
-                    # FIX: Completely restore capital to the active wallet on Exception Crash
                     self.available_balance += locked_capital
                     
                     state.position_size -= quantity
@@ -789,23 +759,14 @@ class LiveTradingEngine:
         finally:
             await asyncio.shield(self._decrement_trade_cap())
 
-    def calculate_ewma_volatility(self, history: collections.deque) -> float:
-        history_list = list(history)
-        ewma = history_list[0]
-        alpha = 2.0 / (len(history_list) + 1)
-        for val in history_list[1:]:
-            ewma = (val * alpha) + (ewma * (1.0 - alpha))
-        return max(15.0, ewma)
-
+    # ==========================================
+    # CORE QUANTITATIVE ENGINE: Welford Mean-Reversion
+    # ==========================================
     async def process_live_tick(self, raw_bytes: bytes):
         if self.shutting_down: return
         
-        if self.last_sync_time == 0.0:
-            return 
-            
-        if time.time() - self.last_sync_time > config.STALE_BALANCE_TIMEOUT_SEC:
-            logger.debug("Stale wallet balance timeout. Suppressing ticks until sync recovers.")
-            return
+        if self.last_sync_time == 0.0: return 
+        if time.time() - self.last_sync_time > config.STALE_BALANCE_TIMEOUT_SEC: return
 
         try:
             parsed_dict = orjson.loads(raw_bytes)
@@ -823,7 +784,6 @@ class LiveTradingEngine:
             except (ValueError, TypeError):
                 state.bids.clear()
                 state.asks.clear()
-                logger.warning("Malformed L2 snapshot received; orderbook cleared.")
             return
             
         if msg_type == "l2update":
@@ -841,12 +801,25 @@ class LiveTradingEngine:
             return
 
         if msg_type != "ticker": return
-        
         try: tick = TickData(**parsed_dict)
         except ValidationError: return
 
         current_time = time.time()
         
+        # 1. Update Welford's Online Variance (O(1))
+        state.welford_count += 1
+        delta = tick.price - state.welford_mean
+        state.welford_mean += delta / state.welford_count
+        delta2 = tick.price - state.welford_mean
+        state.welford_m2 += delta * delta2
+        
+        # 2. Update Recursive EMA Anchor (O(1))
+        if state.ewma_price == 0.0:
+            state.ewma_price = tick.price
+        else:
+            alpha = 0.01  # Approximately 200 tick half-life
+            state.ewma_price = (tick.price * alpha) + (state.ewma_price * (1.0 - alpha))
+
         if current_time < state.cooldown_until:
             state.last_price = tick.price
             return
@@ -855,57 +828,39 @@ class LiveTradingEngine:
         state.last_price = tick.price
         if not last_price: return
 
+        # Reset Event State when Contract rolls over
         if state.active_contract_id and state.active_contract_id != state.last_seen_contract_id:
-            if state.period_open_price > 0.0:
-                volatility = abs(tick.price - state.period_open_price)
-                state.history.append(volatility)
-            state.period_open_price = tick.price
             state.last_seen_contract_id = state.active_contract_id
-            
             async with self.balance_lock:
                 state.position_side = None
                 state.position_size = 0
 
-        if state.period_open_price == 0.0 or not state.active_contract_id: return
+        if state.ewma_price == 0.0 or not state.active_contract_id: return
         if state.expiration_time == 0.0: return
         seconds_left = state.expiration_time - current_time
 
+        # Temporal Burn-in and Lock-out rules
         if seconds_left > 480.0: return 
         if seconds_left < 180.0: return 
+        if state.welford_count < config.MIN_WELFORD_TICKS: return
 
-        time_since_iv = current_time - state.last_iv_update_time
-        if state.implied_volatility > 0.0 and time_since_iv < 120.0:
-            iv_pct = state.implied_volatility / 100.0
-            time_fraction = seconds_left / 31536000.0
-            remaining_vol_price = tick.price * iv_pct * math.sqrt(time_fraction)
-        else:
-            ewma_15m_vol = self.calculate_ewma_volatility(state.history)
-            time_ratio = max(0.01, seconds_left / 900.0)
-            remaining_vol_price = ewma_15m_vol * math.sqrt(time_ratio)
-            
-        distance = tick.price - state.strike_price
-        z_score = distance / max(1e-4, remaining_vol_price) 
-        base_prob_yes = 0.5 * (1.0 + math.erf(z_score / math.sqrt(2.0)))
+        # 3. Calculate Z-Score for Mean-Reversion Evaluation
+        variance = state.welford_m2 / state.welford_count
+        std_dev = math.sqrt(variance) if variance > 0 else 0.0
+        if std_dev == 0.0: return
         
-        depth_threshold = tick.price * 0.001
-        bid_vol = sum(size for p, size in state.bids.items() if p >= tick.price - depth_threshold)
-        ask_vol = sum(size for p, size in state.asks.items() if p <= tick.price + depth_threshold)
+        z_score = (tick.price - state.ewma_price) / std_dev
         
-        oib = 0.0
-        if (bid_vol + ask_vol) > 0:
-            oib = (bid_vol - ask_vol) / (bid_vol + ask_vol)
-            
-        prob_yes = max(0.01, min(0.99, base_prob_yes + (oib * 0.05)))
-        prob_no = 1.0 - prob_yes
-        
-        if prob_yes > config.MIN_PROBABILITY_THRESHOLD:
-            trade_side = "YES"
-            fair_value = prob_yes
-        elif prob_no > config.MIN_PROBABILITY_THRESHOLD:
+        # 4. Fade Logic: If price spikes heavily, buy the cheap reversion side.
+        trade_side = None
+        if z_score > config.Z_SCORE_THRESHOLD:
+            # Price spiked artificially HIGH above anchor. Fade it.
             trade_side = "NO"
-            fair_value = prob_no
-        else:
-            return 
+        elif z_score < -config.Z_SCORE_THRESHOLD:
+            # Price flash-crashed artificially LOW below anchor. Fade it.
+            trade_side = "YES"
+            
+        if not trade_side: return 
 
         if state.position_side and state.position_side != trade_side: return 
 
@@ -923,12 +878,8 @@ class LiveTradingEngine:
         best_bid, best_ask = best_vals
         spread = round(best_ask - best_bid, 4)
         
-        if best_ask >= (fair_value - config.MIN_EDGE_REQUIREMENT):
-            await self._decrement_trade_cap()
-            return
-
-        # --- SAST FIX 4: Dynamic Max Spread Guard ---
-        if spread > config.MAX_ALLOWED_SPREAD or best_ask >= 0.85 or best_bid < 0.01:
+        # 5. The Pricing Guard: We are fading a breakout, so the side we buy must be cheap.
+        if spread > config.MAX_ALLOWED_SPREAD or best_ask > config.MAX_FADE_PRICE or best_bid < 0.01:
             await self._decrement_trade_cap()
             return
         
@@ -956,8 +907,7 @@ class LiveTradingEngine:
             state.position_size += quantity
             state.cooldown_until = current_time + 15.0
         
-        calc_src = "IV" if (state.implied_volatility > 0.0 and time_since_iv < 120.0) else "EWMA"
-        logger.warning(f"[{tick.product_id}] EDGE FOUND ({calc_src}+OIB)! FV: ${fair_value:.2f} | Ask: ${best_ask:.2f} | Sniping {quantity} '{trade_side}' contracts.")
+        logger.warning(f"[{tick.product_id}] EDGE FOUND (MEAN-REVERSION)! Z-Score: {z_score:.2f} | Ask: ${best_ask:.2f} | Fading fake breakout, sniping {quantity} '{trade_side}' contracts.")
         
         exec_task = asyncio.create_task(
             self.execute_and_hold_entry(
@@ -981,14 +931,6 @@ class LiveTradingEngine:
     async def process_binance_liquidation(self, raw_bytes: bytes):
         if self.shutting_down: return
         
-        # --- SAST FIX 1: Stale Balance Guard ---
-        if self.last_sync_time == 0.0:
-            return 
-            
-        if time.time() - self.last_sync_time > config.STALE_BALANCE_TIMEOUT_SEC:
-            return
-
-        # --- SAST FIX 2: Observability Heartbeat ---
         self._binance_events_received += 1
         if self._binance_events_received % 500 == 0:
             logger.info(f"[BINANCE FEED] {self._binance_events_received} total events received. Feed is alive & actively dropping non-qualifying orders.")
@@ -1011,12 +953,16 @@ class LiveTradingEngine:
             if not state or not state.active_contract_id: return
             
             notional = payload.o.p * payload.o.q
-            if notional < config.BINANCE_LIQUIDATION_THRESHOLD:
-                return 
-                
+            if notional < config.BINANCE_LIQUIDATION_THRESHOLD: return 
+            
             if payload.o.S == "SELL": trade_side = "NO"
             elif payload.o.S == "BUY": trade_side = "YES"
             else: return
+
+            # --- SAST FIX: Check Stale Balance AFTER qualifying event to avoid log spam ---
+            if self.last_sync_time == 0.0 or time.time() - self.last_sync_time > config.STALE_BALANCE_TIMEOUT_SEC: 
+                logger.warning(f"[{asset_symbol}] Dropping qualifying liquidation event (${notional:,.2f}) — balance data is stale.")
+                return
             
             current_time = time.time()
             if current_time < state.cooldown_until: return
@@ -1036,7 +982,6 @@ class LiveTradingEngine:
                 
             best_bid, best_ask = best_vals
             
-            # --- SAST FIX 3: Dynamic Max Spread Guard ---
             if best_ask >= 0.85 or best_bid < 0.01 or (best_ask - best_bid) > config.MAX_ALLOWED_SPREAD:
                 await self._decrement_trade_cap()
                 return
@@ -1225,9 +1170,6 @@ async def main():
             asyncio.create_task(binance_worker_loop(engine, binance_queue), name="binance_worker")
         ]
         
-        if env_mode in ["live", "paper"]:
-            tasks.append(asyncio.create_task(engine.sync_implied_volatility_loop(), name="sync_implied_vol"))
-            
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
         pass
