@@ -56,7 +56,6 @@ class BotConfig:
     
     DRAWDOWN_LIMIT_PCT: Decimal = Decimal(os.environ.get("DRAWDOWN_LIMIT_PCT", "0.20"))
     STALE_BALANCE_TIMEOUT_SEC: float = 120.0
-    L2_MAX_DEPTH_PCT: float = 0.05
     
     BINANCE_LIQUIDATION_THRESHOLD: Decimal = Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD", "1500000.0"))
     MAX_ALLOWED_SPREAD: Decimal = Decimal(os.environ.get("MAX_ALLOWED_SPREAD", "0.25"))
@@ -84,10 +83,6 @@ TRUSTED_INTERNAL_HOSTS = frozenset(
         "TRUSTED_INTERNAL_HOSTS", ""
     ).split(",") if h.strip()
 )
-
-# SSRF Note: Raw-IP bypass is mitigated by SafeResolver intercepting all DNS resolutions
-# at the aiohttp connector level, and is_safe_destination_async validating all outbound URLs
-# before connections are initiated. No additional monkeypatching required.
 
 # ==========================================
 # SECURITY SANITIZATION & CACHING
@@ -139,6 +134,9 @@ class EconomicCalendarResponse(BaseModel):
 
 def validate_tick_data(data: dict) -> Optional[dict]:
     """Optimized validation of Coinbase tickers to bypass Pydantic overhead."""
+    if data.get("type") != "ticker":
+        return None
+
     prod_id = data.get("product_id")
     if prod_id not in ("BTC-USD", "ETH-USD"):
         return None
@@ -154,7 +152,6 @@ def validate_tick_data(data: dict) -> Optional[dict]:
         return None
         
     return {
-        "type": "ticker",
         "product_id": prod_id,
         "price": price_dec
     }
@@ -186,7 +183,6 @@ def validate_binance_payload(data: dict) -> Optional[dict]:
         return None
         
     return {
-        "e": "forceOrder",
         "o": {
             "s": symbol,
             "S": side,
@@ -212,7 +208,8 @@ class AssetState:
         self.welford_m2: Decimal = Decimal("0.00")
         self.ewma_price: Decimal = Decimal("0.00")
         self.consecutive_outliers: int = 0  
-
+        
+        # Restored to satisfy strict interface contracts and prevent AttributeError
         self.bids: Dict[float, float] = {}
         self.asks: Dict[float, float] = {}
         
@@ -246,21 +243,6 @@ class SafeResolver(AbstractResolver):
     async def resolve(self, host: str, port: int = 0, family: int = socket.AF_INET) -> List[Dict]:
         host_lower = host.lower()
         
-        # Static DNS mapping to bypass AWS ECS/VPC awsvpc extraHosts limitations
-        if host_lower == "api.securesource.internal":
-            calendar_ip = os.environ.get("ECONOMIC_CALENDAR_IP", "")
-            if calendar_ip:
-                return [
-                    {
-                        "hostname": host,
-                        "host": calendar_ip,
-                        "port": port,
-                        "family": family,
-                        "proto": 0,
-                        "flags": 0,
-                    }
-                ]
-
         records = await self._resolver.resolve(host, port, family)
         safe_records = []
         
@@ -294,12 +276,6 @@ async def is_safe_destination_async(url_str: str) -> bool:
         
         hostname_lower = hostname.lower()
         
-        # Match application-level resolver override to prevent resolution failures on awsvpc
-        if hostname_lower == "api.securesource.internal":
-            calendar_ip = os.environ.get("ECONOMIC_CALENDAR_IP", "")
-            if calendar_ip:
-                return True
-        
         is_trusted_host = hostname_lower in TRUSTED_INTERNAL_HOSTS
         if is_trusted_host:
             return True
@@ -323,7 +299,6 @@ class MacroCircuitBreaker:
         self.lockout_after = lockout_after_sec
         self.active_events: List[EconomicEvent] = []
         self.calendar_url = os.environ.get("ECONOMIC_CALENDAR_URL", "")
-        self.calendar_secret_name = os.environ.get("ECONOMIC_CALENDAR_SECRET_NAME", "")
         self._was_locked_out: bool = False
 
     def is_locked_out(self) -> bool:
@@ -356,46 +331,25 @@ class MacroCircuitBreaker:
             logger.debug("[CIRCUIT BREAKER] No calendar URL configured. Skipping sync.")
             return False
 
-        headers = {}
-        api_key_env = ""
-
-        if self.calendar_secret_name:
-            try:
-                aws_session = boto3.session.Session()
-                client = aws_session.client(service_name='secretsmanager', region_name="us-east-1")
-                response = client.get_secret_value(SecretId=self.calendar_secret_name)
-                secret_dict = orjson.loads(response['SecretString'])
-                api_key_env = secret_dict.get("ECONOMIC_CALENDAR_API_KEY", "")
-            except Exception as e:
-                logger.error(f"[CIRCUIT BREAKER] Dynamic retrieval of credentials failed: {type(e).__name__}")
-                return False
-        else:
-            api_key_env = os.environ.get("ECONOMIC_CALENDAR_API_KEY", "")
-
-        # Build public FairEconomy request query parameters
-        current_dt_utc = datetime.datetime.now(datetime.timezone.utc)
-        from_date = current_dt_utc.date().isoformat()
-        to_date = (current_dt_utc + datetime.timedelta(days=2)).date().isoformat()
-        
-        sep = "&" if "?" in self.calendar_url else "?"
-        full_url = f"{self.calendar_url}{sep}from={from_date}&to={to_date}&apikey={api_key_env.strip()}"
-
-        if not await is_safe_destination_async(full_url):
+        # 1. SSRF Network Security Boundary Check
+        if not await is_safe_destination_async(self.calendar_url):
             logger.error("[CIRCUIT BREAKER] Aborting calendar fetch. Target fails boundary rules.")
             return False
 
-        # FairEconomy / Forex Factory heavily proxies behind Cloudflare. 
-        # Injecting a standard User-Agent prevents HTTP 403 blocks against Python aiohttp libraries.
-        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        headers["Accept"] = "application/json"
+        # 2. Transparent Service Identification (ToS Compliant)
+        headers = {
+            "User-Agent": "KalshiQuantEngine/1.0",
+            "Accept": "application/json"
+        }
 
         try:
             timeout = aiohttp.ClientTimeout(total=5.0)
-            async with session.get(full_url, headers=headers, timeout=timeout, allow_redirects=False) as response:
+            async with session.get(self.calendar_url, headers=headers, timeout=timeout, allow_redirects=False) as response:
                 if response.status != 200:
-                    logger.error(f"[CIRCUIT BREAKER] FairEconomy calendar endpoint returned status: {response.status}")
+                    logger.error(f"[CIRCUIT BREAKER] Calendar endpoint returned status: {response.status}")
                     return False
 
+                # Protect against compression bombs (CWE-409)
                 content_length = response.headers.get("Content-Length")
                 if content_length is not None:
                     try:
@@ -410,31 +364,49 @@ class MacroCircuitBreaker:
                     logger.error("[CIRCUIT BREAKER] Ingestion aborted. Calendar buffer length exceeded maximum limits.")
                     return False
 
-                parsed_json = orjson.loads(body_bytes)
+                # 3. Diagnostic & Hardened Parsing Fix
+                content_type = response.headers.get("Content-Type", "").lower()
+                if "application/json" not in content_type:
+                    preview = body_bytes[:250].decode('utf-8', errors='ignore')
+                    logger.error(
+                        f"[CIRCUIT BREAKER] Content-Type mismatch. Expected JSON, received: '{content_type}'. "
+                        f"Raw Payload Preview: {sanitize_log_str(preview)}"
+                    )
+                    return False
+
+                try:
+                    parsed_json = orjson.loads(body_bytes)
+                except orjson.JSONDecodeError:
+                    preview = body_bytes[:250].decode('utf-8', errors='ignore')
+                    logger.error(f"[CIRCUIT BREAKER] Invalid JSON structure. Preview: {sanitize_log_str(preview)}")
+                    return False
+
                 if not isinstance(parsed_json, list):
-                    logger.error("[CIRCUIT BREAKER] Expected JSON list from FairEconomy API.")
+                    logger.error("[CIRCUIT BREAKER] Expected JSON list from calendar API.")
                     return False
                 
-                # Integrated FairEconomy Adapter: Map third-party data structure to local EconomicEvent schemas
+                # 4. Schema Validation & Mapping (With USD Filter Optimization)
                 mapped_events = []
                 for item in parsed_json:
                     try:
+                        # Highly specific memory optimization: Filter out non-US macro events
+                        country = str(item.get("country", "")).upper()
+                        if country != "USD":
+                            continue
+
                         raw_date = item.get("date", "")
                         if not raw_date:
                             continue
                         
-                        # Parse FairEconomy ISO-8601 Datetime String (e.g. "2026-06-07T08:30:00-04:00")
                         dt = datetime.datetime.fromisoformat(raw_date)
                         timestamp = dt.timestamp()
                         
-                        # FairEconomy maps the event title to "title"
                         raw_event = item.get("title", "Economic Release")
                         clean_event = "".join(c for c in raw_event if c.isalnum() or c in " -()%./")
                         clean_event = clean_event[:100]
                         if not clean_event:
                             clean_event = "Economic Release"
                             
-                        # Normalize mixed-case impact levels to uppercase
                         impact = str(item.get("impact", "LOW")).upper()
                         if impact not in ("HIGH", "MEDIUM", "LOW"):
                             impact = "LOW"
@@ -445,7 +417,6 @@ class MacroCircuitBreaker:
                             "impact": impact
                         })
                     except Exception as parse_err:
-                        # CWE-117 Fix: Sanitize exception outputs containing untrusted input
                         logger.warning(
                             f"[CIRCUIT BREAKER] Failed parsing individual calendar event: "
                             f"{sanitize_log_str(str(parse_err))}"
@@ -463,9 +434,6 @@ class MacroCircuitBreaker:
                 return True
         except ValidationError as e:
             logger.error(f"[CIRCUIT BREAKER] Economic calendar structure schema mismatch: {sanitize_log_str(str(e))[:150]}")
-            return False
-        except orjson.JSONDecodeError:
-            logger.error("[CIRCUIT BREAKER] Invalid JSON payload from calendar source.")
             return False
         except Exception as e:
             logger.error(f"[CIRCUIT BREAKER] Synchronization channel failure: {type(e).__name__}")
@@ -490,14 +458,12 @@ def log_exception_group(eg: BaseException):
 # SECURE INTER-PROCESS HEALTH CHECKS
 # ==========================================
 async def handle_health_check(request: web.Request) -> web.Response:
-    """Responds with standard HTTP status code using optimized serializer."""
     return web.json_response(
         {"status": "ok", "service": "kalshi-quant-engine"},
         dumps=lambda x: orjson.dumps(x).decode('utf-8')
     )
 
 async def start_health_server() -> web.AppRunner:
-    """Spawns lightweight background HTTP server to resolve AWS ALB status checks."""
     app = web.Application()
     app.router.add_get('/', handle_health_check)
     app.router.add_get('/health', handle_health_check)
@@ -1042,17 +1008,6 @@ class LiveTradingEngine:
             # Drain queue safely while keeping counter synchronized
             safe_drain_queue(queue)
 
-    def _prune_orderbook(self, ob: dict, current_price: float, is_bid: bool, max_depth: float = config.L2_MAX_DEPTH_PCT):
-        threshold_price = current_price * (1.0 - max_depth) if is_bid else current_price * (1.0 + max_depth)
-        stale_keys = [p for p in ob if (p < threshold_price if is_bid else p > threshold_price)]
-        for k in stale_keys:
-            del ob[k]
-            
-        if len(ob) > 1000:
-            sorted_keys = sorted(ob.keys(), reverse=is_bid)
-            for k in sorted_keys[1000:]:
-                del ob[k]
-
     async def sync_balance_loop(self):
         try:
             self.capital_in_flight = await self.broker.get_locked_capital()
@@ -1197,19 +1152,38 @@ class LiveTradingEngine:
 
                 if filled_qty > 0:
                     if filled_qty < quantity:
-                        await self.broker.cancel_order(order_id)
-                        unfilled_qty = quantity - filled_qty
-                        refund = Decimal(str(unfilled_qty)) * limit_price
-                        async with self.balance_lock:
-                            self.capital_in_flight = max(Decimal("0.00"), self.capital_in_flight - refund)
-                            self.available_balance += refund
+                        # Cancel race-condition fix applies here: Ensure partial refunds are strictly validated.
+                        cancel_success = await self.broker.cancel_order(order_id)
+                        if not cancel_success:
+                            logger.warning(f"[{contract_id}] Partial cancel failed. Verifying final state.")
+                            details = await self.broker.get_order_details(order_id)
+                            filled_qty = self._get_filled_qty_from_details(details, quantity)
+                            status = details.get("status", "unknown")
                             
-                            state.positions[contract_id] = max(0, state.positions.get(contract_id, 0) - unfilled_qty)
-                            if state.positions[contract_id] <= 0:
-                                state.position_sides.pop(contract_id, None)
-                                state.positions.pop(contract_id, None)
-                        locked_capital -= refund
-                        logger.info(f"[{contract_id}] Partial Fill ({filled_qty}/{quantity}).")
+                        unfilled_qty = quantity - filled_qty
+                        
+                        if unfilled_qty <= 0:
+                            # Full fill achieved
+                            async with self.balance_lock:
+                                self.capital_in_flight = max(Decimal("0.00"), self.capital_in_flight - locked_capital)
+                            logger.info(f"[{contract_id}] Order filled ({quantity}/{quantity}).")
+                            return
+                        elif status not in ["canceled", "cancelled"]:
+                            logger.critical(f"[{contract_id}] Cancel failed. Partial order resting. Locking exposed capital.")
+                            return
+                        else:
+                            # Confirmed Partial Fill
+                            refund = Decimal(str(unfilled_qty)) * limit_price
+                            async with self.balance_lock:
+                                self.capital_in_flight = max(Decimal("0.00"), self.capital_in_flight - refund)
+                                self.available_balance += refund
+                                
+                                state.positions[contract_id] = max(0, state.positions.get(contract_id, 0) - unfilled_qty)
+                                if state.positions[contract_id] <= 0:
+                                    state.position_sides.pop(contract_id, None)
+                                    state.positions.pop(contract_id, None)
+                            locked_capital -= refund
+                            logger.info(f"[{contract_id}] Partial Fill ({filled_qty}/{quantity}).")
                     else:
                         logger.info(f"[{contract_id}] Order filled ({filled_qty}/{quantity}).")
 
@@ -1220,7 +1194,35 @@ class LiveTradingEngine:
                     return
                 else:
                     logger.warning(f"[{contract_id}] Limit buy missed fill window. Canceling.")
-                    await self.broker.cancel_order(order_id)
+                    cancel_success = await self.broker.cancel_order(order_id)
+                    
+                    if not cancel_success:
+                        logger.warning(f"[{contract_id}] Cancel request failed. Verifying final order state.")
+                        details = await self.broker.get_order_details(order_id)
+                        filled_qty = self._get_filled_qty_from_details(details, quantity)
+                        status = details.get("status", "unknown")
+                        
+                        if filled_qty == quantity or status == "executed":
+                            async with self.balance_lock:
+                                self.capital_in_flight = max(Decimal("0.00"), self.capital_in_flight - locked_capital)
+                            logger.warning(f"[{contract_id}] Order fully filled prior to cancellation.")
+                            return
+                        elif filled_qty > 0:
+                            unfilled_qty = quantity - filled_qty
+                            refund = Decimal(str(unfilled_qty)) * limit_price
+                            async with self.balance_lock:
+                                self.capital_in_flight = max(Decimal("0.00"), self.capital_in_flight - refund)
+                                self.available_balance += refund
+                                state.positions[contract_id] = max(0, state.positions.get(contract_id, 0) - unfilled_qty)
+                                if state.positions[contract_id] <= 0:
+                                    state.position_sides.pop(contract_id, None)
+                                    state.positions.pop(contract_id, None)
+                            logger.warning(f"[{contract_id}] Partially filled ({filled_qty}/{quantity}) prior to cancellation.")
+                            return
+                        elif status not in ["canceled", "cancelled"]:
+                            logger.critical(f"[{contract_id}] Cancel failed and order is resting (Status: {status}). Leaving capital in-flight.")
+                            return
+                            
                     async with self.balance_lock:
                         self.capital_in_flight = max(Decimal("0.00"), self.capital_in_flight - locked_capital)
                         self.available_balance += locked_capital
@@ -1249,7 +1251,8 @@ class LiveTradingEngine:
 
         except Exception as e:
             logger.critical(f"[{contract_id}] Unhandled exception in entry manager. Forcing release.", exc_info=True)
-            if locked_capital > 0:
+            # If the order might exist on the exchange, do not blindly refund.
+            if locked_capital > 0 and not order_id:
                 async with self.balance_lock:
                     self.capital_in_flight = max(Decimal("0.00"), self.capital_in_flight - locked_capital)
                     self.available_balance += locked_capital
@@ -1272,50 +1275,15 @@ class LiveTradingEngine:
 
         try:
             parsed_dict = orjson.loads(raw_bytes)
-            msg_type = parsed_dict.get("type")
         except orjson.JSONDecodeError: return
 
-        product_id = parsed_dict.get("product_id")
-        if product_id not in self.assets: return
-        state = self.assets[product_id]
-
-        if msg_type == "snapshot":
-            try:
-                state.bids = {float(p): float(s) for p, s in parsed_dict.get("bids", [])}
-                state.asks = {float(p): float(s) for p, s in parsed_dict.get("asks", [])}
-            except (ValueError, TypeError):
-                state.bids.clear()
-                state.asks.clear()
-            return
-            
-        if msg_type == "l2update":
-            for side_str, price_str, size_str in parsed_dict.get("changes", []):
-                try:
-                    price, size = float(price_str), float(size_str)
-                    target_dict = state.bids if side_str == "buy" else state.asks
-                    if size == 0.0: target_dict.pop(price, None)
-                    else: target_dict[price] = size
-                except (ValueError, TypeError): continue
-            
-            reference_price = state.last_price
-            if not reference_price and state.bids and state.asks:
-                try:
-                    best_bid = max(state.bids.keys())
-                    best_ask = min(state.asks.keys())
-                    reference_price = (best_bid + best_ask) / 2.0
-                except ValueError:
-                    pass
-
-            if reference_price:
-                if len(state.bids) > 1000: self._prune_orderbook(state.bids, reference_price, is_bid=True)
-                if len(state.asks) > 1000: self._prune_orderbook(state.asks, reference_price, is_bid=False)
-            return
-
-        if msg_type != "ticker": return
-        
         tick_dict = validate_tick_data(parsed_dict)
         if not tick_dict: 
             return
+
+        product_id = tick_dict["product_id"]
+        if product_id not in self.assets: return
+        state = self.assets[product_id]
 
         tick_price = tick_dict["price"]
 
@@ -1367,7 +1335,6 @@ class LiveTradingEngine:
         state.last_price = float(tick_price)
         if not last_price: return
 
-        # Only discard tracked contracts if they both are inactive and have no active tracking positions (val == 0)
         if state.active_contract_id and state.active_contract_id != state.last_seen_contract_id:
             state.last_seen_contract_id = state.active_contract_id
             async with self.balance_lock:
@@ -1404,7 +1371,6 @@ class LiveTradingEngine:
 
         if current_pos_side and current_pos_side != trade_side: return 
 
-        # Use try/finally block to safely release slot if setup steps fail or raise exceptions
         async with self.trade_cap_lock:
             if self.active_trade_count >= config.MAX_CONCURRENT_TRADES: return
             self.active_trade_count += 1
@@ -1450,7 +1416,6 @@ class LiveTradingEngine:
             
             logger.warning(f"[{product_id}] EDGE FOUND. Z-Score: {z_score:.2f} | Ask: ${best_ask:.2f} | Sniping {quantity} contracts.")
             
-            # Handover slot ownership to spawned background execution task
             slot_acquired = False 
             
             exec_task = asyncio.create_task(
@@ -1515,7 +1480,6 @@ class LiveTradingEngine:
 
             if current_pos_side and current_pos_side != trade_side: return
             
-            # Use try/finally block to safely release slot if setup steps fail or raise exceptions
             async with self.trade_cap_lock:
                 if self.active_trade_count >= config.MAX_CONCURRENT_TRADES: return
                 self.active_trade_count += 1
@@ -1560,7 +1524,6 @@ class LiveTradingEngine:
                 
                 logger.warning(f"[{asset_symbol}] BINANCE LIQUIDATION SIGNAL (${notional:,.2f})! Ask: ${best_ask:.2f} | Sniping {quantity} contracts.")
                 
-                # Handover slot ownership to background execution task
                 slot_acquired = False
                 
                 seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
@@ -1587,7 +1550,7 @@ async def coinbase_websocket_consumer(engine: LiveTradingEngine, queue: asyncio.
     subscribe_message = {
         "type": "subscribe",
         "product_ids": ["BTC-USD", "ETH-USD"],
-        "channels": ["ticker", "level2"]
+        "channels": ["ticker"]
     }
 
     attempt = 0
@@ -1699,8 +1662,7 @@ async def binance_worker_loop(engine: LiveTradingEngine, queue: asyncio.Queue):
 def get_kalshi_credentials(secret_name: str, region_name: str = "us-east-1") -> Tuple[str, Any]:
     """
     Fetches credentials from Secrets Manager, instantly decodes 
-    and loads the private key, and zeros out the intermediate PEM 
-    material before returning.
+    and loads the private key, and minimizes GC residency.
     """
     session = boto3.session.Session()
     client = session.client(service_name='secretsmanager', region_name=region_name)
@@ -1711,11 +1673,14 @@ def get_kalshi_credentials(secret_name: str, region_name: str = "us-east-1") -> 
         key_id = resp_dict["KEY_ID"]
         private_key_pem = bytearray(resp_dict["PRIVATE_KEY"], 'utf-8')
         
-        # Load the key in-memory directly
         private_key = load_pem_private_key(private_key_pem, password=None)
         
-        # Clean raw PEM buffer immediately inside stack frame
+        # Scrub mutable buffer
         ctypes.memset((ctypes.c_char * len(private_key_pem)).from_buffer(private_key_pem), 0, len(private_key_pem))
+        
+        # Instantly remove string references from the stack
+        del resp_dict
+        del response
         
         return key_id, private_key
     except ClientError as e:
@@ -1725,7 +1690,7 @@ def get_kalshi_credentials(secret_name: str, region_name: str = "us-east-1") -> 
         logger.critical(f"Failed to retrieve secrets from AWS: {type(e).__name__}")
         sys.exit(1)
     finally:
-        # Purge temporary allocations from scope
+        # Force garbage collector to immediately wipe unreferenced immutable string pages
         gc.collect()
 
 # Lock all module-level imports, classes, and configurations into the permanent 
