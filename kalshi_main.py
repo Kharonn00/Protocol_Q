@@ -323,6 +323,7 @@ class MacroCircuitBreaker:
         self.lockout_after = lockout_after_sec
         self.active_events: List[EconomicEvent] = []
         self.calendar_url = os.environ.get("ECONOMIC_CALENDAR_URL", "")
+        self.calendar_secret_name = os.environ.get("ECONOMIC_CALENDAR_SECRET_NAME", "")
         self._was_locked_out: bool = False
 
     def is_locked_out(self) -> bool:
@@ -355,22 +356,44 @@ class MacroCircuitBreaker:
             logger.debug("[CIRCUIT BREAKER] No calendar URL configured. Skipping sync.")
             return False
 
-        if not await is_safe_destination_async(self.calendar_url):
+        headers = {}
+        api_key_env = ""
+
+        if self.calendar_secret_name:
+            try:
+                aws_session = boto3.session.Session()
+                client = aws_session.client(service_name='secretsmanager', region_name="us-east-1")
+                response = client.get_secret_value(SecretId=self.calendar_secret_name)
+                secret_dict = orjson.loads(response['SecretString'])
+                api_key_env = secret_dict.get("ECONOMIC_CALENDAR_API_KEY", "")
+            except Exception as e:
+                logger.error(f"[CIRCUIT BREAKER] Dynamic retrieval of credentials failed: {type(e).__name__}")
+                return False
+        else:
+            api_key_env = os.environ.get("ECONOMIC_CALENDAR_API_KEY", "")
+
+        # Build public FairEconomy request query parameters
+        current_dt_utc = datetime.datetime.now(datetime.timezone.utc)
+        from_date = current_dt_utc.date().isoformat()
+        to_date = (current_dt_utc + datetime.timedelta(days=2)).date().isoformat()
+        
+        sep = "&" if "?" in self.calendar_url else "?"
+        full_url = f"{self.calendar_url}{sep}from={from_date}&to={to_date}&apikey={api_key_env.strip()}"
+
+        if not await is_safe_destination_async(full_url):
             logger.error("[CIRCUIT BREAKER] Aborting calendar fetch. Target fails boundary rules.")
             return False
 
         # FairEconomy / Forex Factory heavily proxies behind Cloudflare. 
         # Injecting a standard User-Agent prevents HTTP 403 blocks against Python aiohttp libraries.
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "application/json"
-        }
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        headers["Accept"] = "application/json"
 
         try:
             timeout = aiohttp.ClientTimeout(total=5.0)
-            async with session.get(self.calendar_url, headers=headers, timeout=timeout, allow_redirects=False) as response:
+            async with session.get(full_url, headers=headers, timeout=timeout, allow_redirects=False) as response:
                 if response.status != 200:
-                    logger.error(f"[CIRCUIT BREAKER] Calendar endpoint returned status: {response.status}")
+                    logger.error(f"[CIRCUIT BREAKER] FairEconomy calendar endpoint returned status: {response.status}")
                     return False
 
                 content_length = response.headers.get("Content-Length")
@@ -389,7 +412,7 @@ class MacroCircuitBreaker:
 
                 parsed_json = orjson.loads(body_bytes)
                 if not isinstance(parsed_json, list):
-                    logger.error("[CIRCUIT BREAKER] Expected JSON list from calendar API.")
+                    logger.error("[CIRCUIT BREAKER] Expected JSON list from FairEconomy API.")
                     return False
                 
                 # Integrated FairEconomy Adapter: Map third-party data structure to local EconomicEvent schemas
@@ -1705,72 +1728,76 @@ def get_kalshi_credentials(secret_name: str, region_name: str = "us-east-1") -> 
         # Purge temporary allocations from scope
         gc.collect()
 
+# Lock all module-level imports, classes, and configurations into the permanent 
+# GC generation to prevent the garbage collector from scanning them during hot loops.
+gc.freeze()
+
 # ==========================================
 # BOOTSTRAPPER
 # ==========================================
-async def main():
-    env_mode = os.environ.get("BOT_ENV", "simulation").lower()
-    
-    if env_mode in ["live", "paper"]:
-        key_id, private_key = get_kalshi_credentials("prod/kalshi/api-keys", region_name="us-east-1")
-        if env_mode == "live":
-            confirm = os.environ.get("LIVE_TRADING_CONFIRM", "")
-            if confirm != "I_ACCEPT_FINANCIAL_RISK":
-                logger.critical("Live mode blocked. Halting.")
-                sys.exit(1)
-            logger.warning("!!! INITIALIZING LIVE TRADING BROKER !!!")
-            broker = LiveKalshiBroker(key_id=key_id, private_key=private_key, paper_trade=False)
-        else:
-            logger.info("Initializing PAPER TRADING Broker.")
-            broker = LiveKalshiBroker(key_id=key_id, private_key=private_key, paper_trade=True)
-    else:
-        logger.info("Initializing SIMULATION Broker.")
-        broker = SimExecutionBroker()
-
-    await broker.start()
-    engine = LiveTradingEngine(broker)
-    
-    if sys.platform != "win32":
-        import signal
-        loop = asyncio.get_running_loop()
-        def _on_sigterm():
-            logger.warning("SIGTERM received from OS. Initiating shutdown...")
-            engine.shutting_down = True
-            for task in asyncio.all_tasks(loop):
-                name = task.get_name()
-                if name and ("consumer" in name or "worker" in name or "sync" in name):
-                    task.cancel()
-        loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
-    
-    health_runner = None
-    try:
-        tick_queue = asyncio.Queue(maxsize=10000) 
-        binance_queue = asyncio.Queue(maxsize=1000)
-        
-        health_runner = await start_health_server()
-        
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(engine.sync_balance_loop(), name="sync_balance")
-            tg.create_task(engine.sync_markets_loop(), name="sync_markets")
-            tg.create_task(engine.sync_macro_calendar_loop(), name="sync_macro_calendar")
-            tg.create_task(coinbase_websocket_consumer(engine, tick_queue), name="consumer")
-            tg.create_task(market_worker_loop(engine, tick_queue), name="worker")
-            tg.create_task(binance_websocket_consumer(engine, binance_queue), name="binance_consumer")
-            tg.create_task(binance_worker_loop(engine, binance_queue), name="binance_worker")
-            
-    except Exception as e:
-        log_exception_group(e)
-    finally:
-        logger.info("Executing final engine shutdown protocols...")
-        if health_runner:
-            try:
-                await health_runner.cleanup()
-            except Exception as ex:
-                logger.warning(f"Error during health server cleanup: {ex}")
-        await engine.shutdown()
-        await broker.close()
-
 if __name__ == "__main__":
+    async def main():
+        env_mode = os.environ.get("BOT_ENV", "simulation").lower()
+        
+        if env_mode in ["live", "paper"]:
+            key_id, private_key = get_kalshi_credentials("prod/kalshi/api-keys", region_name="us-east-1")
+            if env_mode == "live":
+                confirm = os.environ.get("LIVE_TRADING_CONFIRM", "")
+                if confirm != "I_ACCEPT_FINANCIAL_RISK":
+                    logger.critical("Live mode blocked. Halting.")
+                    sys.exit(1)
+                logger.warning("!!! INITIALIZING LIVE TRADING BROKER !!!")
+                broker = LiveKalshiBroker(key_id=key_id, private_key=private_key, paper_trade=False)
+            else:
+                logger.info("Initializing PAPER TRADING Broker.")
+                broker = LiveKalshiBroker(key_id=key_id, private_key=private_key, paper_trade=True)
+        else:
+            logger.info("Initializing SIMULATION Broker.")
+            broker = SimExecutionBroker()
+
+        await broker.start()
+        engine = LiveTradingEngine(broker)
+        
+        if sys.platform != "win32":
+            import signal
+            loop = asyncio.get_running_loop()
+            def _on_sigterm():
+                logger.warning("SIGTERM received from OS. Initiating shutdown...")
+                engine.shutting_down = True
+                for task in asyncio.all_tasks(loop):
+                    name = task.get_name()
+                    if name and ("consumer" in name or "worker" in name or "sync" in name):
+                        task.cancel()
+            loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
+        
+        health_runner = None
+        try:
+            tick_queue = asyncio.Queue(maxsize=10000) 
+            binance_queue = asyncio.Queue(maxsize=1000)
+            
+            health_runner = await start_health_server()
+            
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(engine.sync_balance_loop(), name="sync_balance")
+                tg.create_task(engine.sync_markets_loop(), name="sync_markets")
+                tg.create_task(engine.sync_macro_calendar_loop(), name="sync_macro_calendar")
+                tg.create_task(coinbase_websocket_consumer(engine, tick_queue), name="consumer")
+                tg.create_task(market_worker_loop(engine, tick_queue), name="worker")
+                tg.create_task(binance_websocket_consumer(engine, binance_queue), name="binance_consumer")
+                tg.create_task(binance_worker_loop(engine, binance_queue), name="binance_worker")
+                
+        except Exception as e:
+            log_exception_group(e)
+        finally:
+            logger.info("Executing final engine shutdown protocols...")
+            if health_runner:
+                try:
+                    await health_runner.cleanup()
+                except Exception as ex:
+                    logger.warning(f"Error during health server cleanup: {ex}")
+            await engine.shutdown()
+            await broker.close()
+
     try: 
         asyncio.run(main())
     except KeyboardInterrupt: 
