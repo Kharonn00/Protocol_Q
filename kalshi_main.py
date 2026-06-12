@@ -915,6 +915,7 @@ class LiveTradingEngine:
         self.active_trade_count: int = 0
         self._binance_events_received: int = 0 
         self.shutting_down: bool = False
+        self.engine_start_time: float = time.time()
 
         self.circuit_breaker = MacroCircuitBreaker(
             lockout_before_sec=config.LOCKOUT_BEFORE_SEC,
@@ -1347,6 +1348,9 @@ class LiveTradingEngine:
 
         if state.tick_count < config.MIN_EMA_TICKS: return
         
+        # Enforce strict 7-minute startup burn-in before allowing trades
+        if current_time - self.engine_start_time < 420.0: return
+
         if seconds_left > 480.0: return 
         if seconds_left < 180.0: return 
         
