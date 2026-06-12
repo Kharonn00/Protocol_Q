@@ -75,6 +75,9 @@ class BotConfig:
     
     TELEMETRY_LOG_INTERVAL_SEC: float = float(os.environ.get("TELEMETRY_LOG_INTERVAL_SEC", "300.0"))
     EMA_ALPHA: Decimal = Decimal(os.environ.get("EMA_ALPHA", "0.00015"))
+    
+    # 88% ROI Take-Profit Trap. Entry cost multiplied by 1.88.
+    TAKE_PROFIT_ROI: Decimal = Decimal(os.environ.get("TAKE_PROFIT_ROI", "1.88"))
 
 config = BotConfig()
 
@@ -1117,6 +1120,85 @@ class LiveTradingEngine:
                 
             await asyncio.sleep(21600)  # Refresh every 6 hours
 
+    async def _monitor_take_profit(self, state: AssetState, contract_id: str, side: str, entry_price: Decimal, quantity: int, seconds_left: float):
+        """Asynchronous O(1) Background Task to execute and monitor Take-Profit exit with cleanup."""
+        if quantity <= 0: return
+        tp_order_id = None
+        tp_filled_qty = 0
+        try:
+            raw_tp = entry_price * config.TAKE_PROFIT_ROI
+            tp_price = min(Decimal("0.99"), raw_tp.quantize(Decimal("0.01")))
+            
+            safe_contract_id = urllib.parse.quote(contract_id, safe='')
+            tp_client_oid = f"tp-{safe_contract_id}-{uuid.uuid4().hex}"
+            
+            # Minor execution delay to allow Kalshi portfolio settlement to catch up to initial fill
+            await asyncio.sleep(0.5)
+
+            logger.info(f"[{contract_id}] Routing Take-Profit: Sell {quantity} '{side.upper()}' @ ${tp_price:.2f}")
+            tp_order_id = await self.broker.execute_trade(
+                action="sell",
+                contract_id=contract_id,
+                side=side,
+                limit_price=tp_price,
+                quantity=quantity,
+                client_order_id=tp_client_oid
+            )
+
+            if not tp_order_id:
+                logger.warning(f"[{contract_id}] Failed to route Take-Profit order. Holding to expiration.")
+                return
+
+            poll_interval = 5.0
+            elapsed = 0.0
+            timeout = max(0.0, seconds_left - 10.0) 
+            fully_executed = False
+            
+            while elapsed < timeout and not self.shutting_down:
+                try:
+                    tp_details = await self.broker.get_order_details(tp_order_id)
+                    tp_status = tp_details.get("status", "unknown")
+                    tp_filled_qty = self._get_filled_qty_from_details(tp_details, quantity)
+                    
+                    if tp_filled_qty >= quantity or tp_status == "executed":
+                        fully_executed = True
+                        break
+                    elif tp_status in ["canceled", "cancelled"]:
+                        logger.info(f"[{contract_id}] Take profit was cancelled mid-flight.")
+                        break
+                except Exception as e:
+                    logger.debug(f"[{contract_id}] Transient error polling TP: {e}")
+                    
+                await asyncio.sleep(poll_interval)
+                elapsed += poll_interval
+                
+            # Clean-up Phase on Timeout/Cancellation
+            if fully_executed:
+                logger.warning(f"[{contract_id}] 🎯 TAKE PROFIT HIT! Sold {tp_filled_qty}x @ ${tp_price:.2f}. ROI Secured.")
+            else:
+                logger.info(f"[{contract_id}] Take-Profit unresolved at buzzer. Cancelling trailing order...")
+                # Force-cancel the resting order to lock in whatever filled during the lifecycle
+                await self.broker.cancel_order(tp_order_id)
+                
+                # Fetch final order details post-cancellation to reconcile exactly how much filled
+                try:
+                    final_details = await self.broker.get_order_details(tp_order_id)
+                    tp_filled_qty = self._get_filled_qty_from_details(final_details, quantity)
+                    logger.info(f"[{contract_id}] Trailing order cancelled. Final filled quantity: {tp_filled_qty}/{quantity}")
+                except Exception as ex:
+                    logger.warning(f"[{contract_id}] Error verifying final partial fill state: {ex}")
+
+            # Reconcile local state with the actual quantity successfully filled
+            if tp_filled_qty > 0:
+                async with self.balance_lock:
+                    state.positions[contract_id] = max(0, state.positions.get(contract_id, 0) - tp_filled_qty)
+                    if state.positions[contract_id] <= 0:
+                        state.position_sides.pop(contract_id, None)
+                        state.positions.pop(contract_id, None)
+
+        except Exception as e:
+            logger.error(f"[{contract_id}] Unhandled error in Take Profit monitor.", exc_info=True)
+
     async def execute_and_hold_entry(self, state: AssetState, contract_id: str, side: str, limit_price: Decimal, quantity: int, total_cost: Decimal, seconds_left: float):
         safe_contract_id = urllib.parse.quote(contract_id, safe='')
         client_entry_oid = f"entry-{safe_contract_id}-{uuid.uuid4().hex}"
@@ -1159,7 +1241,6 @@ class LiveTradingEngine:
 
                 if filled_qty > 0:
                     if filled_qty < quantity:
-                        # Cancel race-condition fix applies here: Ensure partial refunds are strictly validated.
                         cancel_success = await self.broker.cancel_order(order_id)
                         if not cancel_success:
                             logger.warning(f"[{contract_id}] Partial cancel failed. Verifying final state.")
@@ -1170,16 +1251,18 @@ class LiveTradingEngine:
                         unfilled_qty = quantity - filled_qty
                         
                         if unfilled_qty <= 0:
-                            # Full fill achieved
                             async with self.balance_lock:
                                 self.capital_in_flight = max(Decimal("0.00"), self.capital_in_flight - locked_capital)
                             logger.info(f"[{contract_id}] Order filled ({quantity}/{quantity}).")
+                            
+                            tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, limit_price, quantity, seconds_left))
+                            self._pending_tasks.add(tp_task)
+                            tp_task.add_done_callback(self._handle_task_done)
                             return
                         elif status not in ["canceled", "cancelled"]:
                             logger.critical(f"[{contract_id}] Cancel failed. Partial order resting. Locking exposed capital.")
                             return
                         else:
-                            # Confirmed Partial Fill
                             refund = Decimal(str(unfilled_qty)) * limit_price
                             async with self.balance_lock:
                                 self.capital_in_flight = max(Decimal("0.00"), self.capital_in_flight - refund)
@@ -1191,14 +1274,22 @@ class LiveTradingEngine:
                                     state.positions.pop(contract_id, None)
                             locked_capital -= refund
                             logger.info(f"[{contract_id}] Partial Fill ({filled_qty}/{quantity}).")
+                            
+                            tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, limit_price, filled_qty, seconds_left))
+                            self._pending_tasks.add(tp_task)
+                            tp_task.add_done_callback(self._handle_task_done)
                     else:
                         logger.info(f"[{contract_id}] Order filled ({filled_qty}/{quantity}).")
 
-                    async with self.balance_lock:
-                        self.capital_in_flight = max(Decimal("0.00"), self.capital_in_flight - locked_capital)
-                    
-                    logger.warning(f"[{contract_id}] Position Secured. Execution task safely terminating.")
-                    return
+                        async with self.balance_lock:
+                            self.capital_in_flight = max(Decimal("0.00"), self.capital_in_flight - locked_capital)
+                        
+                        tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, limit_price, filled_qty, seconds_left))
+                        self._pending_tasks.add(tp_task)
+                        tp_task.add_done_callback(self._handle_task_done)
+                        
+                        logger.warning(f"[{contract_id}] Position Secured. Execution task safely terminating.")
+                        return
                 else:
                     logger.warning(f"[{contract_id}] Limit buy missed fill window. Canceling.")
                     cancel_success = await self.broker.cancel_order(order_id)
@@ -1213,6 +1304,10 @@ class LiveTradingEngine:
                             async with self.balance_lock:
                                 self.capital_in_flight = max(Decimal("0.00"), self.capital_in_flight - locked_capital)
                             logger.warning(f"[{contract_id}] Order fully filled prior to cancellation.")
+                            
+                            tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, limit_price, quantity, seconds_left))
+                            self._pending_tasks.add(tp_task)
+                            tp_task.add_done_callback(self._handle_task_done)
                             return
                         elif filled_qty > 0:
                             unfilled_qty = quantity - filled_qty
@@ -1225,6 +1320,10 @@ class LiveTradingEngine:
                                     state.position_sides.pop(contract_id, None)
                                     state.positions.pop(contract_id, None)
                             logger.warning(f"[{contract_id}] Partially filled ({filled_qty}/{quantity}) prior to cancellation.")
+                            
+                            tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, limit_price, filled_qty, seconds_left))
+                            self._pending_tasks.add(tp_task)
+                            tp_task.add_done_callback(self._handle_task_done)
                             return
                         elif status not in ["canceled", "cancelled"]:
                             logger.critical(f"[{contract_id}] Cancel failed and order is resting (Status: {status}). Leaving capital in-flight.")
@@ -1258,7 +1357,6 @@ class LiveTradingEngine:
 
         except Exception as e:
             logger.critical(f"[{contract_id}] Unhandled exception in entry manager. Forcing release.", exc_info=True)
-            # If the order might exist on the exchange, do not blindly refund.
             if locked_capital > 0 and not order_id:
                 async with self.balance_lock:
                     self.capital_in_flight = max(Decimal("0.00"), self.capital_in_flight - locked_capital)
@@ -1302,8 +1400,8 @@ class LiveTradingEngine:
                 if state.consecutive_outliers >= config.CONSECUTIVE_OUTLIER_LIMIT:
                     logger.warning(f"[OUTLIER SHIELD] Detected {state.consecutive_outliers} consecutive outlier ticks. Forcing baseline reset.")
                     state.ewma_price = tick_price
-                    state.ewma_variance = Decimal("0.00") # Resets EMV Volatility
-                    state.tick_count = 1                  # Resets Tick Tracker
+                    state.ewma_variance = Decimal("0.00") 
+                    state.tick_count = 1                  
                     state.consecutive_outliers = 0
                     state.last_price = float(tick_price)
                     return  
@@ -1324,7 +1422,6 @@ class LiveTradingEngine:
             alpha = config.EMA_ALPHA
             delta = tick_price - state.ewma_price
             state.ewma_price += alpha * delta
-            # Calculate Exponential Variance (EMV)
             state.ewma_variance = (Decimal("1.00") - alpha) * (state.ewma_variance + alpha * delta * delta)
 
         if current_time < state.cooldown_until:
@@ -1351,8 +1448,6 @@ class LiveTradingEngine:
         seconds_left = state.expiration_time - current_time
 
         if state.tick_count < config.MIN_EMA_TICKS: return
-        
-        # Enforce strict 7-minute startup burn-in before allowing trades
         if current_time - self.engine_start_time < 420.0: return
 
         if seconds_left > 480.0: return 
@@ -1367,10 +1462,18 @@ class LiveTradingEngine:
         z_score = float((tick_price - state.ewma_price) / std_dev)
         
         trade_side = None
+        
+        # O(1) Strike Alignment Gate
         if z_score > config.Z_SCORE_THRESHOLD:
-            trade_side = "NO"
+            # We fade the spike UP. We expect reversion DOWN. 
+            # Mean destination (EWMA) must be safely BELOW the strike price.
+            if state.ewma_price < Decimal(str(state.strike_price)):
+                trade_side = "NO"
         elif z_score < -config.Z_SCORE_THRESHOLD:
-            trade_side = "YES"
+            # We fade the crash DOWN. We expect reversion UP.
+            # Mean destination (EWMA) must be safely ABOVE the strike price.
+            if state.ewma_price >= Decimal(str(state.strike_price)):
+                trade_side = "YES"
             
         if not trade_side: return 
 
