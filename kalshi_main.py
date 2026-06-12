@@ -139,7 +139,7 @@ def validate_tick_data(data: dict) -> Optional[dict]:
         return None
 
     prod_id = data.get("product_id")
-    if prod_id not in ("BTC-USD", "ETH-USD"):
+    if prod_id not in ("BTC-USD", "HYPE-USD"):
         return None
     
     raw_price = data.get("price")
@@ -943,7 +943,7 @@ class LiveTradingEngine:
         
         self.assets: Dict[str, AssetState] = {
             "BTC-USD": AssetState(),
-            "ETH-USD": AssetState(),
+            "HYPE-USD": AssetState(),
         }
         self._pending_tasks: Set[asyncio.Task] = set()
 
@@ -1447,7 +1447,7 @@ class LiveTradingEngine:
                 
             symbol = payload_dict["o"]["s"]
             if "BTC" in symbol: asset_symbol = "BTC-USD"
-            elif "ETH" in symbol: asset_symbol = "ETH-USD"
+            elif "HYPE" in symbol: asset_symbol = "HYPE-USD"
             else: return
             
             state = self.assets.get(asset_symbol)
@@ -1765,4 +1765,4 @@ if __name__ == "__main__":
     try: 
         asyncio.run(main())
     except KeyboardInterrupt: 
-        logger.info("Bot halted manually.")
+        logger.info("Bot halted manually."))
