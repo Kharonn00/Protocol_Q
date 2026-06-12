@@ -61,8 +61,8 @@ class BotConfig:
     MAX_ALLOWED_SPREAD: Decimal = Decimal(os.environ.get("MAX_ALLOWED_SPREAD", "0.25"))
 
     Z_SCORE_THRESHOLD: float = float(os.environ.get("Z_SCORE_THRESHOLD", "2.5"))
-    MIN_WELFORD_TICKS: int = int(os.environ.get("MIN_WELFORD_TICKS", "100"))
-    MAX_FADE_PRICE: Decimal = Decimal(os.environ.get("MAX_FADE_PRICE", "0.45"))
+    MIN_EMA_TICKS: int = int(os.environ.get("MIN_EMA_TICKS", "100"))
+    MAX_FADE_PRICE: Decimal = Decimal(os.environ.get("MAX_FADE_PRICE", "0.52"))
     MAX_PRICE_DEVIATION_PCT: float = 0.15      
     CONSECUTIVE_OUTLIER_LIMIT: int = 5         
     STD_DEV_FLOOR: float = 0.05                
@@ -71,6 +71,7 @@ class BotConfig:
     LOCKOUT_AFTER_SEC: float = float(os.environ.get("LOCKOUT_AFTER_SEC", "1800.0"))
     
     TELEMETRY_LOG_INTERVAL_SEC: float = float(os.environ.get("TELEMETRY_LOG_INTERVAL_SEC", "300.0"))
+    EMA_ALPHA: Decimal = Decimal(os.environ.get("EMA_ALPHA", "0.00015"))
 
 config = BotConfig()
 
@@ -203,10 +204,10 @@ class AssetState:
         self.cooldown_until: float = 0.0
         self.last_seen_contract_id: str = ""
 
-        self.welford_count: int = 0
-        self.welford_mean: Decimal = Decimal("0.00")  
-        self.welford_m2: Decimal = Decimal("0.00")
-        self.ewma_price: Decimal = Decimal("0.00")
+        # Transitioned to O(1) Exponential Variables
+        self.tick_count: int = 0
+        self.ewma_price: Decimal = Decimal("0.00")  
+        self.ewma_variance: Decimal = Decimal("0.00")
         self.consecutive_outliers: int = 0  
         
         # Restored to satisfy strict interface contracts and prevent AttributeError
@@ -1039,7 +1040,7 @@ class LiveTradingEngine:
                     asset_status_summaries = []
                     for symbol, state in self.assets.items():
                         if state.last_price is not None:
-                            variance = state.welford_m2 / Decimal(str(state.welford_count)) if state.welford_count > 0 else Decimal("0.00")
+                            variance = state.ewma_variance
                             std_dev = math.sqrt(float(variance)) if variance > Decimal("0.00") else 0.0
                             
                             if std_dev >= config.STD_DEV_FLOOR:
@@ -1049,7 +1050,7 @@ class LiveTradingEngine:
                                 z_score_repr = "N/A (Low Volatility)"
                                 
                             asset_status_summaries.append(
-                                f"{symbol} [Price: ${state.last_price:.2f} | EWMA: ${float(state.ewma_price):.2f} | Ticks: {state.welford_count}/{config.MIN_WELFORD_TICKS} | Z-Score: {z_score_repr}]"
+                                f"{symbol} [Price: ${state.last_price:.2f} | EWMA: ${float(state.ewma_price):.2f} | Ticks: {state.tick_count}/{config.MIN_EMA_TICKS} | Z-Score: {z_score_repr}]"
                             )
                         else:
                             asset_status_summaries.append(f"{symbol} [Warmup: No Tick Matches Ingested]")
@@ -1295,10 +1296,9 @@ class LiveTradingEngine:
                 if state.consecutive_outliers >= config.CONSECUTIVE_OUTLIER_LIMIT:
                     logger.warning(f"[OUTLIER SHIELD] Detected {state.consecutive_outliers} consecutive outlier ticks. Forcing baseline reset.")
                     state.ewma_price = tick_price
+                    state.ewma_variance = Decimal("0.00") # Resets EMV Volatility
+                    state.tick_count = 1                  # Resets Tick Tracker
                     state.consecutive_outliers = 0
-                    state.welford_count = 1
-                    state.welford_mean = tick_price
-                    state.welford_m2 = Decimal("0.00")
                     state.last_price = float(tick_price)
                     return  
                 else:
@@ -1309,19 +1309,17 @@ class LiveTradingEngine:
 
         current_time = time.time()
         
-        # Update Welford computations
-        state.welford_count += 1
-        delta = tick_price - state.welford_mean
-        state.welford_mean += delta / Decimal(str(state.welford_count))
-        delta2 = tick_price - state.welford_mean
-        state.welford_m2 += delta * delta2
-        
-        # Update EMA Anchor
+        # O(1) Exponential Moving Variance & Mean Update
+        state.tick_count += 1
         if state.ewma_price == Decimal("0.00"):
             state.ewma_price = tick_price
+            state.ewma_variance = Decimal("0.00")
         else:
-            alpha = Decimal("0.01")  
-            state.ewma_price = (tick_price * alpha) + (state.ewma_price * (Decimal("1.00") - alpha))
+            alpha = config.EMA_ALPHA
+            delta = tick_price - state.ewma_price
+            state.ewma_price += alpha * delta
+            # Calculate Exponential Variance (EMV)
+            state.ewma_variance = (Decimal("1.00") - alpha) * (state.ewma_variance + alpha * delta * delta)
 
         if current_time < state.cooldown_until:
             state.last_price = float(tick_price)
@@ -1348,10 +1346,10 @@ class LiveTradingEngine:
 
         if seconds_left > 480.0: return 
         if seconds_left < 180.0: return 
-        if state.welford_count < config.MIN_WELFORD_TICKS: return
+        if state.tick_count < config.MIN_EMA_TICKS: return
 
-        variance = state.welford_m2 / Decimal(str(state.welford_count))
-        std_dev = Decimal(str(math.sqrt(float(variance)))) if variance > Decimal("0.00") else Decimal("0.00")
+        # Localized Standard Deviation based purely on recent volatility
+        std_dev = state.ewma_variance.sqrt() if state.ewma_variance > Decimal("0.00") else Decimal("0.00")
         
         if std_dev < Decimal(str(config.STD_DEV_FLOOR)):
             return
@@ -1549,7 +1547,7 @@ async def coinbase_websocket_consumer(engine: LiveTradingEngine, queue: asyncio.
     uri = "wss://ws-feed.exchange.coinbase.com" 
     subscribe_message = {
         "type": "subscribe",
-        "product_ids": ["BTC-USD", "ETH-USD"],
+        "product_ids": ["BTC-USD", "HYPE-USD"],
         "channels": ["ticker"]
     }
 

@@ -90,3 +90,4 @@ CACHEDIR.TAG
 # Gemini CLI
 GEMINI.md
 *.md
+*.skill
