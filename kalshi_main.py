@@ -1454,7 +1454,8 @@ class LiveTradingEngine:
             if not state or not state.active_contract_id: return
             
             notional = payload_dict["o"]["p"] * payload_dict["o"]["q"]
-            if notional < config.BINANCE_LIQUIDATION_THRESHOLD: return 
+            threshold = config.BINANCE_LIQUIDATION_THRESHOLDS.get(asset_symbol)
+            if not threshold or notional < threshold: return 
 
             if payload_dict["o"]["S"] == "SELL": 
                 trade_side = "NO"
