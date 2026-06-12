@@ -380,10 +380,14 @@ class MacroCircuitBreaker:
 
                 try:
                     parsed_json = orjson.loads(body_bytes)
-                except orjson.JSONDecodeError:
-                    preview = body_bytes[:250].decode('utf-8', errors='ignore')
-                    logger.error(f"[CIRCUIT BREAKER] Invalid JSON structure. Preview: {sanitize_log_str(preview)}")
-                    return False
+                except orjson.JSONDecodeError as e:
+                    import json
+                    try:
+                        parsed_json = json.loads(body_bytes.decode('utf-8', errors='ignore'), strict=False)
+                    except json.JSONDecodeError as json_e:
+                        preview = body_bytes[:250].decode('utf-8', errors='ignore')
+                        logger.error(f"[CIRCUIT BREAKER] Invalid JSON structure. Error: {json_e}. Preview: {sanitize_log_str(preview)}")
+                        return False
 
                 if not isinstance(parsed_json, list):
                     logger.error("[CIRCUIT BREAKER] Expected JSON list from calendar API.")
