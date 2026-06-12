@@ -1345,10 +1345,11 @@ class LiveTradingEngine:
         if state.expiration_time == 0.0: return
         seconds_left = state.expiration_time - current_time
 
+        if state.tick_count < config.MIN_EMA_TICKS: return
+        
         if seconds_left > 480.0: return 
         if seconds_left < 180.0: return 
-        if state.tick_count < config.MIN_EMA_TICKS: return
-
+        
         # Localized Standard Deviation based purely on recent volatility
         std_dev = state.ewma_variance.sqrt() if state.ewma_variance > Decimal("0.00") else Decimal("0.00")
         
