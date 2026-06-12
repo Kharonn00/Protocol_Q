@@ -24,7 +24,7 @@ import socket
 import gc
 from functools import lru_cache
 from decimal import Decimal, InvalidOperation
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, List, Set, Any
 from abc import ABC, abstractmethod
 from pydantic import BaseModel, Field, ValidationError
@@ -57,7 +57,10 @@ class BotConfig:
     DRAWDOWN_LIMIT_PCT: Decimal = Decimal(os.environ.get("DRAWDOWN_LIMIT_PCT", "0.20"))
     STALE_BALANCE_TIMEOUT_SEC: float = 120.0
     
-    BINANCE_LIQUIDATION_THRESHOLD: Decimal = Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD", "1500000.0"))
+    BINANCE_LIQUIDATION_THRESHOLDS: Dict[str, Decimal] = field(default_factory=lambda: {
+        "BTC-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_BTC", "1500000.0")),
+        "HYPE-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_HYPE", "100000.0"))
+    })
     MAX_ALLOWED_SPREAD: Decimal = Decimal(os.environ.get("MAX_ALLOWED_SPREAD", "0.25"))
 
     Z_SCORE_THRESHOLD: float = float(os.environ.get("Z_SCORE_THRESHOLD", "2.5"))
@@ -715,9 +718,7 @@ class LiveKalshiBroker(ExecutionBroker):
                             except Exception:
                                 strike_val = 0.0
                                 
-                        if strike_val <= 500.0:
-                            continue
-                            
+                        # Removed hardcoded BTC-specific strike filter to support assets like HYPE ($58)
                         distance = abs(current_price - strike_val)
                         if distance < smallest_distance:
                             smallest_distance = distance
@@ -1041,10 +1042,10 @@ class LiveTradingEngine:
                     for symbol, state in self.assets.items():
                         if state.last_price is not None:
                             variance = state.ewma_variance
-                            std_dev = math.sqrt(float(variance)) if variance > Decimal("0.00") else 0.0
+                            std_dev = variance.sqrt() if variance > Decimal("0.00") else Decimal("0.00")
                             
-                            if std_dev >= config.STD_DEV_FLOOR:
-                                z_score_val = float((Decimal(str(state.last_price)) - state.ewma_price) / Decimal(str(std_dev)))
+                            if std_dev >= Decimal(str(config.STD_DEV_FLOOR)):
+                                z_score_val = float((Decimal(str(state.last_price)) - state.ewma_price) / std_dev)
                                 z_score_repr = f"{z_score_val:+.2f}"
                             else:
                                 z_score_repr = "N/A (Low Volatility)"
@@ -1765,4 +1766,4 @@ if __name__ == "__main__":
     try: 
         asyncio.run(main())
     except KeyboardInterrupt: 
-        logger.info("Bot halted manually."))
+        logger.info("Bot halted manually.")
