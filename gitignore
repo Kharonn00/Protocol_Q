@@ -88,3 +88,4 @@ CACHEDIR.TAG
 *.key
 *.p12
 *.pfx
+*.skill

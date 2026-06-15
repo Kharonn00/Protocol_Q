@@ -4,17 +4,37 @@
 FROM python:3.12-slim AS builder
 
 # SECURITY: Clean apt cache immediately to reduce attack surface and layer size
-RUN apt-get update && apt-get install -y --no-install-recommends gcc build-essential \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    build-essential \
+    curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Rust Compiler Toolchain
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
 
 # Create a virtual environment to hold dependencies securely
 RUN python -m venv /opt/venv
-# Ensure all pip commands run inside the virtual environment
+# Ensure all pip/maturin commands run inside the virtual environment
 ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
+
+# Copy Rust project manifest and source
+COPY Cargo.toml Cargo.lock ./
+COPY src/ ./src/
+
+# Copy and install python dependencies + Maturin
 COPY requirements.txt .
+RUN pip install --no-cache-dir maturin patchelf
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Compile PyO3 extension and install it into venv
+RUN maturin build --release --strip && pip install target/wheels/*.whl
 
 # ==========================================
 # STAGE 2: The Runtime (Secure & Immutable)
