@@ -25,7 +25,7 @@ import ipaddress
 import socket
 import gc
 from functools import lru_cache
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_UP
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, List, Set, Any
 from abc import ABC, abstractmethod
@@ -53,8 +53,8 @@ logger = logging.getLogger("KalshiQuantEngine")
 class BotConfig:
     MAX_CONCURRENT_TRADES: int = 2
     TRADE_BUDGET_PCT: Decimal = Decimal(os.environ.get("TRADE_BUDGET_PCT", "0.03"))
-    MAX_CONTRACTS_PER_TRADE: int = 500
-    MAX_EXPOSURE_PER_EVENT: int = 1500
+    MAX_CONTRACTS_PER_TRADE: int = 100
+    MAX_EXPOSURE_PER_EVENT: int = 100
     
     DRAWDOWN_LIMIT_PCT: Decimal = Decimal(os.environ.get("DRAWDOWN_LIMIT_PCT", "0.20"))
     STALE_BALANCE_TIMEOUT_SEC: float = 120.0
@@ -62,12 +62,14 @@ class BotConfig:
     BINANCE_LIQUIDATION_THRESHOLDS: Dict[str, Decimal] = field(default_factory=lambda: {
         "BTC-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_BTC", "1500000.0")),
         "HYPE-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_HYPE", "100000.0")),
-        "SOL-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_SOL", "100000.0"))
+        "SOL-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_SOL", "100000.0")),
+        "ETH-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_ETH", "750000.0")),
+        "DOGE-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_DOGE", "300000.0"))
     })
     MAX_ALLOWED_SPREAD: Decimal = Decimal(os.environ.get("MAX_ALLOWED_SPREAD", "0.25"))
 
     Z_SCORE_THRESHOLD: float = float(os.environ.get("Z_SCORE_THRESHOLD", "2.5"))
-    MIN_EMA_TICKS: int = int(os.environ.get("MIN_EMA_TICKS", "100"))
+    MIN_EMA_TICKS: int = int(os.environ.get("MIN_EMA_TICKS", "1000"))
     MAX_FADE_PRICE: Decimal = Decimal(os.environ.get("MAX_FADE_PRICE", "0.52"))
     MAX_PRICE_DEVIATION_PCT: float = 0.15      
     CONSECUTIVE_OUTLIER_LIMIT: int = 5         
@@ -77,11 +79,11 @@ class BotConfig:
     LOCKOUT_AFTER_SEC: float = float(os.environ.get("LOCKOUT_AFTER_SEC", "1800.0"))
     
     TELEMETRY_LOG_INTERVAL_SEC: float = float(os.environ.get("TELEMETRY_LOG_INTERVAL_SEC", "300.0"))
-    EMA_ALPHA: Decimal = Decimal(os.environ.get("EMA_ALPHA", "0.00015"))
+    EMA_ALPHA: Decimal = Decimal(os.environ.get("EMA_ALPHA", "0.015"))
     
     # Dynamic TP Range parameters
-    MIN_TP_ROI: Decimal = Decimal(os.environ.get("MIN_TP_ROI", "1.15"))
-    MAX_TP_ROI: Decimal = Decimal(os.environ.get("MAX_TP_ROI", "1.60"))
+    MIN_TP_ROI: Decimal = Decimal(os.environ.get("MIN_TP_ROI", "1.50"))
+    MAX_TP_ROI: Decimal = Decimal(os.environ.get("MAX_TP_ROI", "1.85"))
     
     # Safety indicators thresholds
     STRIKE_SAFETY_BUFFER_SD: float = float(os.environ.get("STRIKE_SAFETY_BUFFER_SD", "0.5"))
@@ -165,7 +167,7 @@ def validate_tick_data(data: dict) -> Optional[dict]:
         return None
 
     prod_id = data.get("product_id")
-    if prod_id not in ("BTC-USD", "HYPE-USD", "SOL-USD"):
+    if prod_id not in ("BTC-USD", "HYPE-USD", "SOL-USD", "ETH-USD", "DOGE-USD"):
         return None
     
     raw_price = data.get("price")
@@ -238,10 +240,11 @@ class AssetState:
         self.last_price: Optional[float] = None
         self.cooldown_until: float = 0.0
         self.last_seen_contract_id: str = ""
+        self.last_traded_event: str = ""
 
         # Transitioned to O(1) Exponential Variables
         self.tick_count: int = 0
-        self.fast_indicators = kalshi_bot.FastIndicators(config.MIN_EMA_TICKS, float(config.EMA_ALPHA))
+        self.fast_indicators = kalshi_bot.FastIndicators(14, float(config.EMA_ALPHA))
         self.consecutive_outliers: int = 0  
         
         # Restored to satisfy strict interface contracts and prevent AttributeError
@@ -306,10 +309,10 @@ def safe_int(val, default_val: int = 0) -> int:
         return val
     try:
         return int(val) # Fast path: native string integer conversion without precision loss
-    except ValueError:
+    except (ValueError, OverflowError):
         try:
             return int(float(val)) # Fallback: handles floats or string-floats ("100.5")
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, OverflowError):
             return default_val
     except TypeError:
         return default_val
@@ -563,7 +566,7 @@ async def start_health_server() -> web.AppRunner:
     port = int(os.environ.get("PORT", "8080"))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info(f"[HEALTH SERVER] Micro HTTP health responder online, listening on port {port}")
+    logger.debug(f"[HEALTH SERVER] Micro HTTP health responder online, listening on port {port}")
     return runner
 
 # ==========================================
@@ -589,7 +592,7 @@ class ExecutionBroker(ABC):
     async def get_best_bid_ask(self, contract_id: str, side: str) -> Optional[Tuple[Decimal, Decimal, int, int]]: pass
 
     @abstractmethod
-    async def get_order_details(self, order_id: str) -> dict: pass
+    async def get_order_details(self, order_id: str, **kwargs) -> dict: pass
     
     @abstractmethod
     async def get_order_by_client_id(self, client_order_id: str) -> dict: pass
@@ -614,10 +617,10 @@ class SimExecutionBroker(ExecutionBroker):
         self.VALID_SIDES = frozenset({"yes", "no"})
 
     async def start(self):
-        logger.info("[SIMULATION] Offline Broker resources initialized.")
+        logger.debug("[SIMULATION] Offline Broker resources initialized.")
 
     async def close(self):
-        logger.info("[SIMULATION] Broker resources cleaned up.")
+        logger.debug("[SIMULATION] Broker resources cleaned up.")
 
     async def get_balance(self) -> Optional[Tuple[Decimal, Decimal]]:
         return self.simulated_balance, self.simulated_balance
@@ -636,7 +639,7 @@ class SimExecutionBroker(ExecutionBroker):
         # Hardened signature implementation aligned with live tuple unpack
         return Decimal("0.40"), Decimal("0.45"), 100, 100
 
-    async def get_order_details(self, order_id: str) -> dict:
+    async def get_order_details(self, order_id: str, **kwargs) -> dict:
         return {"status": "executed", "unfilled_count": "0"}
 
     async def get_order_by_client_id(self, client_order_id: str) -> dict:
@@ -692,6 +695,8 @@ class LiveKalshiBroker(ExecutionBroker):
             await self.session.close()
         if hasattr(self, "private_key"):
             self.private_key = None
+        if hasattr(self, "key_id"):
+            self.key_id = None
         gc.collect()
 
     async def _read_json(self, response: aiohttp.ClientResponse, limit: int = 524288) -> Any:
@@ -950,22 +955,39 @@ class LiveKalshiBroker(ExecutionBroker):
             logger.error("Orderbook fetch error", exc_info=True)
         return None
 
-    async def get_order_details(self, order_id: str, simulate: bool = True, cached_best_vals=None) -> dict:
+    async def get_order_details(self, order_id: str, simulate: bool = True, cached_best_vals=None, **kwargs) -> dict:
         if order_id.startswith("paper-"):
             order_data = self._paper_orders.get(order_id)
             if not order_data:
                 return {}
             
+            avg_price = Decimal("0.00")
+            if order_data["filled_quantity"] > 0:
+                avg_price = order_data["total_cost"] / Decimal(order_data["filled_quantity"])
+            else:
+                avg_price = order_data["limit_price"]
+
             if order_data["status"] == "executed":
-                return {"status": "executed", "executed_count": str(order_data["quantity"]), "unfilled_count": "0"}
+                return {
+                    "status": "executed",
+                    "executed_count": str(order_data["quantity"]),
+                    "unfilled_count": "0",
+                    "average_fill_price": str(avg_price)
+                }
             if order_data["status"] == "canceled":
-                return {"status": "canceled", "executed_count": str(order_data["filled_quantity"]), "unfilled_count": str(order_data["quantity"] - order_data["filled_quantity"])}
+                return {
+                    "status": "canceled",
+                    "executed_count": str(order_data["filled_quantity"]),
+                    "unfilled_count": str(order_data["quantity"] - order_data["filled_quantity"]),
+                    "average_fill_price": str(avg_price)
+                }
                 
             if not simulate:
                 return {
                     "status": order_data["status"],
                     "executed_count": str(order_data["filled_quantity"]),
-                    "unfilled_count": str(order_data["quantity"] - order_data["filled_quantity"])
+                    "unfilled_count": str(order_data["quantity"] - order_data["filled_quantity"]),
+                    "average_fill_price": str(avg_price)
                 }
 
             # High-Fidelity Paper Trading Simulation Engine: Query the real exchange orderbook 
@@ -980,7 +1002,12 @@ class LiveKalshiBroker(ExecutionBroker):
             
             best_vals = cached_best_vals if cached_best_vals else await self.get_best_bid_ask(contract_id, side)
             if order_data.get("status") == "canceled":
-                return {"status": "canceled", "executed_count": str(order_data["filled_quantity"]), "unfilled_count": str(order_data["quantity"] - order_data["filled_quantity"])}
+                return {
+                    "status": "canceled",
+                    "executed_count": str(order_data["filled_quantity"]),
+                    "unfilled_count": str(order_data["quantity"] - order_data["filled_quantity"]),
+                    "average_fill_price": str(avg_price)
+                }
 
             if best_vals:
                 best_bid, best_ask, bid_depth, ask_depth = best_vals
@@ -991,6 +1018,9 @@ class LiveKalshiBroker(ExecutionBroker):
                     new_fills = min(remaining, ask_depth)
                     if new_fills > 0:
                         order_data["filled_quantity"] += new_fills
+                        order_data["total_cost"] += Decimal(new_fills) * best_ask
+                        # Refund price improvement
+                        self._paper_balance += (limit_price - best_ask) * Decimal(new_fills)
                         if cached_best_vals is not None:
                             cached_best_vals[3] -= new_fills
                         logger.warning(f"[PAPER BROKER PARTIAL] BUY fill: {new_fills}x {contract_id} '{side.upper()}' @ ${best_ask:.2f} (Total: {order_data['filled_quantity']}/{quantity})")
@@ -999,21 +1029,43 @@ class LiveKalshiBroker(ExecutionBroker):
                     new_fills = min(remaining, bid_depth)
                     if new_fills > 0:
                         order_data["filled_quantity"] += new_fills
+                        order_data["total_cost"] += Decimal(new_fills) * best_bid
                         if cached_best_vals is not None:
                             cached_best_vals[2] -= new_fills
-                        total_credit = limit_price * Decimal(new_fills)
+                        # Credit actual execution price (best_bid)
+                        total_credit = best_bid * Decimal(new_fills)
                         self._paper_balance += total_credit
                         logger.warning(f"[PAPER BROKER PARTIAL] SELL fill: {new_fills}x {contract_id} '{side.upper()}' @ ${best_bid:.2f} (Total: {order_data['filled_quantity']}/{quantity})")
                 
+                if quantity <= 0:
+                    order_data["status"] = "executed"
+                    return {
+                        "status": "executed",
+                        "executed_count": "0",
+                        "unfilled_count": "0",
+                        "average_fill_price": str(limit_price)
+                    }
                 if order_data["filled_quantity"] >= quantity:
                     order_data["status"] = "executed"
+                    avg_price = order_data["total_cost"] / Decimal(quantity)
                     logger.warning(f"[PAPER BROKER COMPLETE] {action.upper()} order finalized for {quantity}x {contract_id}")
-                    return {"status": "executed", "executed_count": str(quantity), "unfilled_count": "0"}
+                    return {
+                        "status": "executed",
+                        "executed_count": str(quantity),
+                        "unfilled_count": "0",
+                        "average_fill_price": str(avg_price)
+                    }
             
+            if order_data["filled_quantity"] > 0:
+                avg_price = order_data["total_cost"] / Decimal(order_data["filled_quantity"])
+            else:
+                avg_price = limit_price
+
             return {
-                "status": "resting", 
+                "status": order_data["status"], 
                 "executed_count": str(order_data["filled_quantity"]), 
-                "unfilled_count": str(quantity - order_data["filled_quantity"])
+                "unfilled_count": str(quantity - order_data["filled_quantity"]),
+                "average_fill_price": str(avg_price)
             }
 
         safe_order_id = urllib.parse.quote(order_id, safe='')
@@ -1087,6 +1139,9 @@ class LiveKalshiBroker(ExecutionBroker):
             return False
 
     async def execute_trade(self, action: str, contract_id: str, side: str, limit_price: Decimal, quantity: int, client_order_id: str = None) -> Optional[str]:
+        if quantity <= 0:
+            logger.error(f"Invalid quantity: {quantity}")
+            return None
         if action.lower() not in self.VALID_ACTIONS or side.lower() not in self.VALID_SIDES: return None
             
         if self.paper_trade:
@@ -1109,6 +1164,7 @@ class LiveKalshiBroker(ExecutionBroker):
                 "limit_price": limit_price,
                 "quantity": quantity,
                 "filled_quantity": 0,
+                "total_cost": Decimal("0.00"),
                 "status": "resting"
             }
             logger.warning(f"[PAPER ORDER PLACED] {action.upper()} {quantity}x {contract_id} '{side.upper()}' @ ${limit_price:.2f}")
@@ -1160,6 +1216,26 @@ class LiveKalshiBroker(ExecutionBroker):
             logger.error("Error executing trade", exc_info=True)
             return None
 
+def _extract_fill_price(details_dict: dict, limit_price: Decimal) -> Decimal:
+    if not details_dict:
+        return limit_price
+    raw_avg_price = None
+    for key in ("average_fill_price", "avg_price", "price"):
+        val = details_dict.get(key)
+        if val is not None and val != "":
+            raw_avg_price = val
+            break
+            
+    if raw_avg_price is not None:
+        try:
+            price_dec = Decimal(str(raw_avg_price))
+            if price_dec >= Decimal("1.00"):
+                return price_dec / Decimal("100.00")
+            return price_dec
+        except Exception:
+            pass
+    return limit_price
+
 # ==========================================
 # QUANTITATIVE PRICING ENGINE
 # ==========================================
@@ -1188,7 +1264,7 @@ class LiveTradingEngine:
         if env_starting_bal is not None:
             try:
                 self.starting_balance = Decimal(env_starting_bal)
-                logger.info(f"[RISK MANAGER] Bound to absolute starting balance: ${self.starting_balance:.2f}")
+                logger.debug(f"[RISK MANAGER] Bound to absolute starting balance: ${self.starting_balance:.2f}")
             except (ValueError, InvalidOperation):
                 logger.warning(f"Malformed STARTING_BALANCE env var: {env_starting_bal}. Falling back to dynamic initialization.")
 
@@ -1199,7 +1275,7 @@ class LiveTradingEngine:
                 impact="HIGH"
             )
             self.circuit_breaker.active_events.append(mock_event)
-            logger.info(f"[CIRCUIT BREAKER] Offline simulation detected. Injected mock HIGH-impact event.")
+            logger.debug(f"[CIRCUIT BREAKER] Offline simulation detected. Injected mock HIGH-impact event.")
         
         self.balance_lock = asyncio.Lock() 
         self.trade_cap_lock = asyncio.Lock()
@@ -1209,10 +1285,13 @@ class LiveTradingEngine:
             "BTC-USD": AssetState(),
             "HYPE-USD": AssetState(),
             "SOL-USD": AssetState(),
+            "ETH-USD": AssetState(),
+            "DOGE-USD": AssetState(),
         }
         self._pending_tasks: Set[asyncio.Task] = set()
         self.performance_tracker = PerformanceTracker()
         self.active_tp_orders: Dict[str, asyncio.Queue] = {}
+        self.orphan_fills: Dict[str, List[dict]] = {}
 
         if sys.platform != 'win32':
             fd, self.heartbeat_file = tempfile.mkstemp(prefix="kalshi_heartbeat_", suffix=".tick")
@@ -1250,7 +1329,6 @@ class LiveTradingEngine:
                 return total_fill
         except (ValueError, InvalidOperation, TypeError):
             pass
-
         if details.get("status") == "executed": return requested_qty
         return 0
 
@@ -1271,14 +1349,14 @@ class LiveTradingEngine:
     async def shutdown(self):
         self.shutting_down = True
         if self._pending_tasks:
-            logger.info(f"Draining {len(self._pending_tasks)} in-flight tasks...")
+            logger.debug(f"Draining {len(self._pending_tasks)} in-flight tasks...")
             done, pending = await asyncio.wait(self._pending_tasks, timeout=10.0)
             if pending:
                 logger.warning(f"Cancelling {len(pending)} unresolved execution tasks before broker closure...")
                 for task in pending:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
-            logger.info("Task drain complete.")
+            logger.debug("Task drain complete.")
 
     def purge_memory(self, queue: asyncio.Queue = None):
         current_time = time.time()
@@ -1323,36 +1401,42 @@ class LiveTradingEngine:
             balance_data = await self.broker.get_balance()
             if balance_data is not None:
                 available_bal, portfolio_val = balance_data
+                state_mutated = False
                 async with self.balance_lock:
                     if self.state_sequence != start_seq:
-                        logger.warning("State mutated during fetch; discarding sync data to prevent race overwrite.")
-                        continue
-                    self.available_balance = available_bal
-                    self.last_sync_time = time.time()
-                    if locked_cap is not None:
-                        self.capital_in_flight = locked_cap
-                    
-                    if positions_data is not None:
-                        for symbol, state in self.assets.items():
-                            base_asset = symbol.split('-')[0]
-                            valid_prefixes = (f"KX{base_asset}15M", f"KX{base_asset}-15M")
-                            asset_positions = {}
-                            asset_position_sides = {}
-                            for cid, (qty, side) in positions_data.items():
-                                if any(cid.startswith(p) for p in valid_prefixes) and qty > 0:
-                                    asset_positions[cid] = qty
-                                    asset_position_sides[cid] = side
-                            state.positions = asset_positions
-                            state.position_sides = asset_position_sides
-                    
-                    if self.starting_balance == Decimal("0.00"):
-                        self.starting_balance = portfolio_val
-                    
-                    if self.starting_balance > 0:
-                        drawdown = (self.starting_balance - portfolio_val) / self.starting_balance
-                        if drawdown >= config.DRAWDOWN_LIMIT_PCT:
-                            logger.critical(f"DRAWDOWN LIMIT REACHED ({drawdown*100:.1f}%). Halting operations.")
-                            self.shutting_down = True
+                        state_mutated = True
+                    else:
+                        self.available_balance = available_bal
+                        self.last_sync_time = time.time()
+                        if locked_cap is not None:
+                            self.capital_in_flight = locked_cap
+                        
+                        if positions_data is not None:
+                            for symbol, state in self.assets.items():
+                                base_asset = symbol.split('-')[0]
+                                valid_prefixes = (f"KX{base_asset}15M", f"KX{base_asset}-15M")
+                                asset_positions = {}
+                                asset_position_sides = {}
+                                for cid, (qty, side) in positions_data.items():
+                                    if any(cid.startswith(p) for p in valid_prefixes) and qty > 0:
+                                        asset_positions[cid] = qty
+                                        asset_position_sides[cid] = side
+                                state.positions = asset_positions
+                                state.position_sides = asset_position_sides
+                        
+                        if self.starting_balance == Decimal("0.00"):
+                            self.starting_balance = portfolio_val
+                        
+                        if self.starting_balance > 0:
+                            drawdown = (self.starting_balance - portfolio_val) / self.starting_balance
+                            if drawdown >= config.DRAWDOWN_LIMIT_PCT:
+                                logger.critical(f"DRAWDOWN LIMIT REACHED ({drawdown*100:.1f}%). Halting operations.")
+                                self.shutting_down = True
+                
+                if state_mutated:
+                    logger.warning("State mutated during fetch; discarding sync data to prevent race overwrite.")
+                    await asyncio.sleep(1.0)  # Prevent zero-delay API spin
+                    continue
                 
                 current_time = time.time()
                 if current_time - self.last_telemetry_log_time >= config.TELEMETRY_LOG_INTERVAL_SEC:
@@ -1401,7 +1485,7 @@ class LiveTradingEngine:
                     
                 contract_id, strike, exp_time = await self.broker.get_active_market(symbol, last_price)
                 if contract_id and state.active_contract_id != contract_id:
-                    logger.info(f"[MARKET ROUTER] {symbol} Locked onto valid contract: {contract_id}")
+                    logger.debug(f"[MARKET ROUTER] {symbol} Locked onto valid contract: {contract_id}")
                     state.active_contract_id = contract_id
                     state.strike_price = strike
                     state.expiration_time = exp_time 
@@ -1424,7 +1508,7 @@ class LiveTradingEngine:
                     success = await self.circuit_breaker.fetch_calendar(session)
 
                 if success:
-                    logger.info(f"[CIRCUIT BREAKER] Economic calendar synchronized.")
+                    logger.debug(f"[CIRCUIT BREAKER] Economic calendar synchronized.")
                 else:
                     logger.warning("[CIRCUIT BREAKER] Calendar synchronization returned no updates or failed validation.")
             except Exception as e:
@@ -1437,7 +1521,7 @@ class LiveTradingEngine:
         if quantity <= 0: return
         try:
             min_tp = config.MIN_TP_ROI
-            max_tp = config.MAX_TP_ROI  # 1.60 = 60% ROI — DO NOT CHANGE
+            max_tp = config.MAX_TP_ROI  # 1.85 = 85% ROI
             clamped_seconds = max(180.0, min(600.0, float(seconds_left)))
             dynamic_multiplier = min_tp + Decimal(str((clamped_seconds - 180.0) / 420.0)) * (max_tp - min_tp)
             
@@ -1445,27 +1529,31 @@ class LiveTradingEngine:
             tp_check = await self.broker.get_best_bid_ask(contract_id, side)
             if tp_check:
                 current_best_bid, _, _, _ = tp_check
-                max_realistic_tp = max(entry_price * Decimal("1.02"), current_best_bid * Decimal("1.30"))
+                max_realistic_tp = max(
+                    entry_price + Decimal("0.01"), 
+                    entry_price * Decimal("1.02"), 
+                    current_best_bid * Decimal("1.30")
+                )
             else:
                 max_realistic_tp = Decimal("0.99")
             
             # === LADDERED EXIT STRATEGY ===
             # Tranche 1 (40%): Conservative — quick-fill exit
-            t1_qty = max(1, int(quantity * 0.40))
-            raw_t1 = entry_price * Decimal("1.12")  # 12% ROI
-            t1_price = min(Decimal("0.99"), max_realistic_tp, raw_t1.quantize(Decimal("0.01")))
+            t1_qty = max(1, round(quantity * 0.40))
+            raw_t1 = (entry_price * Decimal("1.50")).quantize(Decimal("0.01"), rounding=ROUND_UP)  # 50% ROI
+            t1_price = min(Decimal("0.99"), max_realistic_tp, raw_t1)
             
-            # Tranche 2 (35%): Dynamic multiplier target (Clamped to realistic TP)
-            t2_qty = max(0, int(quantity * 0.35))
+            # Tranche 2 (35%): Dynamic multiplier target
+            t2_qty = max(0, round(quantity * 0.35))
             if t1_qty + t2_qty > quantity:
                 t2_qty = quantity - t1_qty
-            raw_t2 = entry_price * dynamic_multiplier
-            t2_price = min(Decimal("0.99"), max_realistic_tp, raw_t2.quantize(Decimal("0.01")))
+            raw_t2 = (entry_price * dynamic_multiplier).quantize(Decimal("0.01"), rounding=ROUND_UP)
+            t2_price = min(Decimal("0.99"), max(t1_price + Decimal("0.01"), raw_t2))
             
-            # Tranche 3 (25%): Aggressive moonshot (Clamped to realistic TP)
+            # Tranche 3 (25%): Aggressive moonshot
             t3_qty = max(0, quantity - t1_qty - t2_qty)
-            raw_t3 = entry_price * Decimal("1.75")  # 75% ROI
-            t3_price = min(Decimal("0.99"), max_realistic_tp, raw_t3.quantize(Decimal("0.01")))
+            raw_t3 = (entry_price * Decimal("1.95")).quantize(Decimal("0.01"), rounding=ROUND_UP)  # 95% ROI
+            t3_price = min(Decimal("0.99"), max(t2_price + Decimal("0.01"), raw_t3))
             
             safe_contract_id = urllib.parse.quote(contract_id, safe='')
             
@@ -1483,7 +1571,7 @@ class LiveTradingEngine:
                 tranches.append((t3_qty, t3_price, "T3-aggressive"))
             
             for tq, tp, label in tranches:
-                tp_client_oid = f"tp-{label}-{safe_contract_id}-{uuid.uuid4().hex}"
+                tp_client_oid = f"tp-{label}-{uuid.uuid4().hex[:12]}"
                 logger.info(f"[{contract_id}] Routing {label} Take-Profit: Sell {tq} '{side.upper()}' @ ${tp:.2f}")
                 tp_order_id = await self.broker.execute_trade(
                     action="sell",
@@ -1494,6 +1582,10 @@ class LiveTradingEngine:
                     client_order_id=tp_client_oid
                 )
                 if tp_order_id:
+                    self.active_tp_orders[tp_order_id] = asyncio.Queue()  # Register immediately to prevent TOCTOU fill loss
+                    if tp_order_id in self.orphan_fills:
+                        for fill_msg in self.orphan_fills.pop(tp_order_id):
+                            self.active_tp_orders[tp_order_id].put_nowait(fill_msg)
                     order_ids.append((tp_order_id, tq, tp, label))
                 else:
                     logger.warning(f"[{contract_id}] Failed to route {label} TP order.")
@@ -1502,9 +1594,7 @@ class LiveTradingEngine:
                 logger.warning(f"[{contract_id}] All TP tranches failed. Holding to expiration.")
                 return
             
-            # Register active orders in our dispatch mapping
-            for oid, _, _, _ in order_ids:
-                self.active_tp_orders[oid] = asyncio.Queue()
+            # (Orders already registered in active_tp_orders dispatch mapping above)
             
             # Monitor all tranches until buzzer
             poll_interval = 5.0
@@ -1662,7 +1752,7 @@ class LiveTradingEngine:
                     logger.warning(f"[{contract_id}] Error verifying final details for {olabel} TP: {ve}")
             
             # Record performance using correct asset parsing key and true net P&L
-            current_hour = int(datetime.datetime.utcnow().hour)
+            current_hour = int(datetime.datetime.now(datetime.timezone.utc).hour)
             total_cost = Decimal(quantity) * entry_price
             net_pnl = total_proceeds - total_cost
             won = net_pnl > 0
@@ -1728,11 +1818,13 @@ class LiveTradingEngine:
             await asyncio.sleep(1.0)
 
     async def execute_and_hold_entry(self, state: AssetState, contract_id: str, side: str, limit_price: Decimal, quantity: int, total_cost: Decimal, seconds_left: float):
-        safe_contract_id = urllib.parse.quote(contract_id, safe='')
-        client_entry_oid = f"entry-{safe_contract_id}-{uuid.uuid4().hex}"
+        order_id = None
         locked_capital = total_cost
 
         try:
+            safe_contract_id = urllib.parse.quote(contract_id, safe='')
+            client_entry_oid = f"entry-{uuid.uuid4().hex[:16]}"
+            
             order_id = await self.broker.execute_trade(
                 action="buy",
                 contract_id=contract_id,
@@ -1749,9 +1841,9 @@ class LiveTradingEngine:
                 logger.info(f"[{contract_id}] BUY Order active. Verifying fill status...")
 
                 filled_qty = 0
-                poll_interval = 2.0
+                poll_interval = 0.2
                 elapsed = 0.0
-                timeout = 10.0 
+                timeout = 0.8 
 
                 while elapsed < timeout:
                     try:
@@ -1792,7 +1884,7 @@ class LiveTradingEngine:
                             await self._update_local_state(Decimal("0.00"), -locked_capital)
                             logger.info(f"[{contract_id}] Order filled ({quantity}/{quantity}).")
                             
-                            tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, limit_price, quantity, seconds_left))
+                            tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, _extract_fill_price(details, limit_price), quantity, seconds_left))
                             self._pending_tasks.add(tp_task)
                             tp_task.add_done_callback(self._handle_task_done)
                             return
@@ -1802,7 +1894,7 @@ class LiveTradingEngine:
                                 await self._update_local_state(Decimal("0.00"), -locked_capital)
                                 logger.info(f"[{contract_id}] Order filled ({quantity}/{quantity}).")
                                 
-                                tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, limit_price, quantity, seconds_left))
+                                tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, _extract_fill_price(details, limit_price), quantity, seconds_left))
                                 self._pending_tasks.add(tp_task)
                                 tp_task.add_done_callback(self._handle_task_done)
                                 return
@@ -1812,7 +1904,7 @@ class LiveTradingEngine:
                                 locked_capital -= refund
                                 logger.info(f"[{contract_id}] Partial Fill ({filled_qty}/{quantity}).")
                                 
-                                tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, limit_price, filled_qty, seconds_left))
+                                tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, _extract_fill_price(details, limit_price), filled_qty, seconds_left))
                                 self._pending_tasks.add(tp_task)
                                 tp_task.add_done_callback(self._handle_task_done)
                                 return
@@ -1824,7 +1916,7 @@ class LiveTradingEngine:
 
                         await self._update_local_state(Decimal("0.00"), -locked_capital)
                         
-                        tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, limit_price, filled_qty, seconds_left))
+                        tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, _extract_fill_price(details, limit_price), filled_qty, seconds_left))
                         self._pending_tasks.add(tp_task)
                         tp_task.add_done_callback(self._handle_task_done)
                         
@@ -1856,7 +1948,7 @@ class LiveTradingEngine:
                         await self._update_local_state(Decimal("0.00"), -locked_capital)
                         logger.warning(f"[{contract_id}] Order fully filled prior to cancellation.")
                         
-                        tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, limit_price, quantity, seconds_left))
+                        tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, _extract_fill_price(details, limit_price), quantity, seconds_left))
                         self._pending_tasks.add(tp_task)
                         tp_task.add_done_callback(self._handle_task_done)
                         return
@@ -1867,7 +1959,7 @@ class LiveTradingEngine:
                             await self._update_local_state(refund, -refund, state, contract_id, -unfilled_qty)
                             logger.warning(f"[{contract_id}] Partially filled ({filled_qty}/{quantity}) prior to cancellation.")
                             
-                            tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, limit_price, filled_qty, seconds_left))
+                            tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, _extract_fill_price(details, limit_price), filled_qty, seconds_left))
                             self._pending_tasks.add(tp_task)
                             tp_task.add_done_callback(self._handle_task_done)
                             return
@@ -1897,8 +1989,7 @@ class LiveTradingEngine:
                 else:
                     # Order was placed, but we crashed mid-lifecycle.
                     # Decrement capital_in_flight locally to avoid permanent leakage, and let sync loop reconcile.
-                    async with self.balance_lock:
-                        self.capital_in_flight = max(Decimal("0.00"), self.capital_in_flight - locked_capital)
+                    await self._update_local_state(Decimal("0.00"), -locked_capital, state, contract_id, -quantity)
             raise
         finally:
             await asyncio.shield(self._decrement_trade_cap())
@@ -1934,7 +2025,7 @@ class LiveTradingEngine:
                 state.consecutive_outliers += 1
                 if state.consecutive_outliers >= config.CONSECUTIVE_OUTLIER_LIMIT:
                     logger.warning(f"[OUTLIER SHIELD] Detected {state.consecutive_outliers} consecutive outlier ticks. Forcing baseline reset.")
-                    state.fast_indicators = kalshi_bot.FastIndicators(config.MIN_EMA_TICKS, float(config.EMA_ALPHA))
+                    state.fast_indicators = kalshi_bot.FastIndicators(14, float(config.EMA_ALPHA))
                     state.fast_indicators.add_price(tick_price)
                     state.tick_count = 1                  
                     state.consecutive_outliers = 0
@@ -1969,92 +2060,63 @@ class LiveTradingEngine:
         state.last_price = tick_price
         if not last_price: return
 
-        # CACHE RUST INDICATORS BEFORE AWAIT TO PREVENT ASYNC RACE CONDITION
-        cached_mean, upper, _ = state.fast_indicators.get_bollinger_bands()
-        cached_std_dev = (upper - cached_mean) / 2.0
-        cached_z_score = state.fast_indicators.get_z_score()
-        cached_rsi = state.fast_indicators.get_rsi()
-        cached_trend = state.fast_indicators.get_trend_alignment()
-
-        if state.active_contract_id and state.active_contract_id != state.last_seen_contract_id:
-            state.last_seen_contract_id = state.active_contract_id
-            # NOTE: We no longer evict state.positions here based on active_contract_id
-            # to prevent the "State Integrity Bypass" vulnerability. Garbage collection
-            # of positions is exclusively handled by sync_balance_loop.
+        # (Dead code for indicator caching and pre-execution guards removed per Security Audit ADV-1)
+        
+        # -------------------------------------------------------------
+        # Z-SCORE MOMENTUM BREAKOUT SNIPER
+        # -------------------------------------------------------------
+        if state.tick_count < config.MIN_EMA_TICKS: return
+        
+        z_score = state.fast_indicators.get_z_score()
+        if abs(z_score) < 2.5: return
 
         if not state.active_contract_id: return
-        if state.expiration_time == 0.0: return
-        seconds_left = state.expiration_time - current_time
-
-        if state.tick_count < config.MIN_EMA_TICKS: return
-        if current_time - self.engine_start_time < 420.0: return
-
-        if seconds_left > 600.0: return 
-        if seconds_left < 180.0: return 
         
-        if cached_std_dev < config.STD_DEV_FLOOR:
-            return
+        seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
+        # The Golden Window: 8 minutes to 3 minutes remaining
+        if seconds_left < 180.0 or seconds_left > 480.0: return
         
-        trade_side = None
-        
-        # O(1) Strike Alignment Gate using Cached State
-        if abs(cached_z_score) > 4.0:
-            pass
-        elif cached_z_score > config.Z_SCORE_THRESHOLD:
-            # We fade the spike UP. We expect reversion DOWN. 
-            # Mean destination must be safely BELOW the strike price with safety buffer.
-            # Only enter if RSI confirms overbought exhaustion.
-            buffer = float(config.STRIKE_SAFETY_BUFFER_SD) * cached_std_dev
-            if cached_mean <= (state.strike_price - buffer) and cached_rsi >= config.RSI_OVERBOUGHT_THRESHOLD and cached_trend < 0:
-                trade_side = "NO"
-        elif cached_z_score < -config.Z_SCORE_THRESHOLD:
-            # We fade the crash DOWN. We expect reversion UP.
-            # Mean destination must be safely ABOVE the strike price with safety buffer.
-            # Only enter if RSI confirms oversold exhaustion.
-            buffer = float(config.STRIKE_SAFETY_BUFFER_SD) * cached_std_dev
-            if cached_mean >= (state.strike_price + buffer) and cached_rsi <= config.RSI_OVERSOLD_THRESHOLD and cached_trend > 0:
-                trade_side = "YES"
-            
-        if trade_side:
-            current_hour = int(datetime.datetime.utcnow().hour)
-            if not self.performance_tracker.should_trade(product_id.split('-')[0], current_hour):
-                logger.info(f"[{product_id}] Performance tracker blocked trade for this asset/hour regime.")
-                trade_side = None
-
-        if not trade_side: return 
-
+        trade_side = "YES" if z_score > 0 else "NO"
         executing_contract_id = state.active_contract_id
-        current_pos_side = state.position_sides.get(executing_contract_id)
-
-        if current_pos_side and current_pos_side != trade_side: return 
-
-        async def evaluate_and_execute():
+        
+        # One trade per asset per event guard
+        if executing_contract_id == getattr(state, "last_traded_event", ""): return
+        
+        slot_acquired = False
+        local_mutated = False
+        try:
             async with self.trade_cap_lock:
-                if self.active_trade_count >= config.MAX_CONCURRENT_TRADES:
-                    state.cooldown_until = 0.0
-                    return
+                if self.active_trade_count >= config.MAX_CONCURRENT_TRADES: return
                 self.active_trade_count += 1
+                slot_acquired = True
+                
+            state.cooldown_until = current_time + 15.0
+            best_vals = await self.broker.get_best_bid_ask(executing_contract_id, trade_side)
+            if not best_vals:
+                return
+                
+            # TOCTOU Security Fixes
+            current_time = time.time()
+            seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
+            if seconds_left < 180.0 or seconds_left > 480.0:
+                return
+            if executing_contract_id != state.active_contract_id:
+                return
+                
+            best_bid, best_ask, bid_depth, ask_depth = best_vals
+            spread = best_ask - best_bid
             
-            slot_acquired = True
-            try:
-                best_vals = await self.broker.get_best_bid_ask(executing_contract_id, trade_side)
-                if not best_vals:
-                    state.cooldown_until = 0.0
-                    return
+            max_spread = min(config.MAX_ALLOWED_SPREAD, max(Decimal("0.05"), best_bid * Decimal("0.30")))
+            if best_ask >= Decimal("0.85") or best_bid < Decimal("0.01") or best_ask < Decimal("0.15") or spread > max_spread:
+                return
                 
-                best_bid, best_ask, bid_depth, ask_depth = best_vals
-                spread = best_ask - best_bid
-                
-                # Dynamic spread limit based on bid price
-                max_spread = min(config.MAX_ALLOWED_SPREAD, max(Decimal("0.05"), best_bid * Decimal("0.30")))
-                if spread > max_spread or best_ask > config.MAX_FADE_PRICE or best_bid < Decimal("0.01") or best_ask < Decimal("0.15"):
-                    state.cooldown_until = 0.0
-                    return
-                
-                limit_price = max(Decimal("0.01"), min(Decimal("0.99"), best_ask))
-                
-                should_decrement = False
-                async with self.balance_lock:
+            limit_price = max(Decimal("0.01"), min(Decimal("0.99"), best_ask))
+            
+            should_decrement = False
+            async with self.balance_lock:
+                if executing_contract_id == getattr(state, "last_traded_event", ""):
+                    should_decrement = True
+                else:
                     current_pos_side = state.position_sides.get(executing_contract_id)
                     if current_pos_side and current_pos_side != trade_side:
                         should_decrement = True
@@ -2068,7 +2130,7 @@ class LiveTradingEngine:
                             raw_quantity = int(trade_budget / limit_price)
                             quantity = min(raw_quantity, config.MAX_CONTRACTS_PER_TRADE, remaining_exposure)
                             
-                            if quantity < 1:
+                            if quantity < 30:
                                 should_decrement = True
                             else:
                                 total_cost = Decimal(quantity) * limit_price
@@ -2077,37 +2139,35 @@ class LiveTradingEngine:
                                 
                                 state.position_sides[executing_contract_id] = trade_side
                                 state.positions[executing_contract_id] = actual_pos_size + quantity
+                                state.last_traded_event = executing_contract_id
                                 state.cooldown_until = current_time + 15.0
                                 self.state_sequence += 1
-                
-                if should_decrement:
-                    state.cooldown_until = 0.0
-                    return
-                
-                logger.warning(f"[{product_id}] EDGE FOUND. Z-Score: {cached_z_score:.2f} | Ask: ${best_ask:.2f} | Sniping {quantity} contracts.")
-                
-                exec_task = asyncio.create_task(
-                    self.execute_and_hold_entry(
-                        state, executing_contract_id, trade_side, limit_price, quantity, total_cost, seconds_left
-                    )
+                                local_mutated = True
+            
+            if should_decrement:
+                return
+            
+            logger.warning(f"[{product_id}] Z-SCORE BREAKOUT ({z_score:.2f})! Ask: ${best_ask:.2f} | Sniping {quantity} contracts.")
+            
+            exec_task = asyncio.create_task(
+                self.execute_and_hold_entry(
+                    state, executing_contract_id, trade_side, limit_price, quantity, total_cost, seconds_left
                 )
-                self._pending_tasks.add(exec_task)
-                exec_task.add_done_callback(self._handle_task_done)
-                slot_acquired = False 
-            except Exception as e:
-                logger.error(f"Error processing tick trade routing for {product_id}: {e}", exc_info=True)
-                state.cooldown_until = 0.0
-            finally:
-                if slot_acquired:
-                    await self._decrement_trade_cap()
-
-        # Lock cooldown immediately before yielding event loop
-        state.cooldown_until = current_time + 15.0
-        # Spawn evaluation and execution in the background to prevent Head-of-Line Blocking
-        eval_task = asyncio.create_task(evaluate_and_execute())
-        self._pending_tasks.add(eval_task)
-        eval_task.add_done_callback(self._handle_task_done)
-        return 
+            )
+            # Safe handoff: explicitly secure strong reference first
+            self._pending_tasks.add(exec_task)
+            exec_task.add_done_callback(self._handle_task_done)
+            slot_acquired = False
+        except Exception as e:
+            logger.error("Z-Score Momentum processing fault", exc_info=True) 
+            if 'exec_task' in locals() and not exec_task.done():
+                exec_task.cancel()
+            if local_mutated and slot_acquired:
+                # Revert leaked local balance if task creation failed
+                await asyncio.shield(self._update_local_state(total_cost, -total_cost, state, executing_contract_id, -quantity))
+        finally:
+            if slot_acquired:
+                await asyncio.shield(self._decrement_trade_cap())
 
     # ==========================================
     # BINANCE LIQUIDATION SNIPER
@@ -2116,13 +2176,22 @@ class LiveTradingEngine:
         if self.shutting_down: return
         
         self._binance_events_received += 1
-        if self._binance_events_received % 500 == 0:
-            logger.info(f"[BINANCE FEED] {self._binance_events_received} total events processed.")
+        if self._binance_events_received % 2000 == 0:
+            events = self._binance_events_received
+            if events >= 1_000_000:
+                fmt_events = f"{events / 1_000_000:.1f}m".replace(".0m", "m")
+            elif events >= 1_000:
+                fmt_events = f"{events / 1_000:.1f}k".replace(".0k", "k")
+            else:
+                fmt_events = str(events)
+            logger.info(f"[HEARTBEAT] Binance Liquidation Sniper active and scanning... ({fmt_events} liquidations processed).")
             
         try:
             parsed_dict = orjson.loads(raw_bytes)
+            # Support combined stream format where actual payload is wrapped in a "data" object
+            event_data = parsed_dict.get("data", parsed_dict)
             
-            payload_dict = validate_binance_payload(parsed_dict)
+            payload_dict = validate_binance_payload(event_data)
             if not payload_dict: 
                 return
                 
@@ -2130,6 +2199,8 @@ class LiveTradingEngine:
             if symbol.startswith("BTCUSDT") or symbol == "BTCUSD_PERP": asset_symbol = "BTC-USD"
             elif symbol.startswith("HYPEUSDT") or symbol == "HYPEUSD_PERP": asset_symbol = "HYPE-USD"
             elif symbol.startswith("SOLUSDT") or symbol == "SOLUSD_PERP": asset_symbol = "SOL-USD"
+            elif symbol.startswith("ETHUSDT") or symbol == "ETHUSD_PERP": asset_symbol = "ETH-USD"
+            elif symbol.startswith("DOGEUSDT") or symbol == "DOGEUSD_PERP": asset_symbol = "DOGE-USD"
             else: return
             
             state = self.assets.get(asset_symbol)
@@ -2157,24 +2228,32 @@ class LiveTradingEngine:
             if current_time < state.cooldown_until: return
             
             seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
-            if seconds_left > 600.0: return
             if seconds_left < 180.0: return
             
             executing_contract_id = state.active_contract_id
-            current_pos_side = state.position_sides.get(executing_contract_id)
-
-            if current_pos_side and current_pos_side != trade_side: return
             
-            async with self.trade_cap_lock:
-                if self.active_trade_count >= config.MAX_CONCURRENT_TRADES: return
-                self.active_trade_count += 1
-                
-            slot_acquired = True
-            state.cooldown_until = current_time + 15.0  # Lock cooldown immediately before yielding event loop
+            # One trade per asset per event guard
+            if executing_contract_id == getattr(state, "last_traded_event", ""): return
+            
+            slot_acquired = False
+            local_mutated = False
             try:
+                async with self.trade_cap_lock:
+                    if self.active_trade_count >= config.MAX_CONCURRENT_TRADES: return
+                    self.active_trade_count += 1
+                    slot_acquired = True
+                    
+                state.cooldown_until = current_time + 15.0  # Lock cooldown immediately before yielding event loop
                 best_vals = await self.broker.get_best_bid_ask(executing_contract_id, trade_side)
                 if not best_vals:
-                    state.cooldown_until = 0.0
+                    return
+                    
+                # TOCTOU Security Fixes
+                current_time = time.time()
+                seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
+                if seconds_left < 180.0:
+                    return
+                if executing_contract_id != state.active_contract_id:
                     return
                     
                 best_bid, best_ask, bid_depth, ask_depth = best_vals
@@ -2182,46 +2261,47 @@ class LiveTradingEngine:
                 
                 # Dynamic spread limit based on bid price
                 max_spread = min(config.MAX_ALLOWED_SPREAD, max(Decimal("0.05"), best_bid * Decimal("0.30")))
-                if best_ask >= Decimal("0.85") or best_bid < Decimal("0.01") or spread > max_spread:
-                    state.cooldown_until = 0.0
+                if best_ask >= Decimal("0.85") or best_bid < Decimal("0.01") or best_ask < Decimal("0.15") or spread > max_spread:
                     return
                     
                 limit_price = max(Decimal("0.01"), min(Decimal("0.99"), best_ask))
                 
                 should_decrement = False
                 async with self.balance_lock:
-                    current_pos_side = state.position_sides.get(executing_contract_id)
-                    if current_pos_side and current_pos_side != trade_side:
+                    if executing_contract_id == getattr(state, "last_traded_event", ""):
                         should_decrement = True
                     else:
-                        actual_pos_size = state.positions.get(executing_contract_id, 0)
-                        remaining_exposure = config.MAX_EXPOSURE_PER_EVENT - actual_pos_size
-                        if remaining_exposure <= 0:
+                        current_pos_side = state.position_sides.get(executing_contract_id)
+                        if current_pos_side and current_pos_side != trade_side:
                             should_decrement = True
                         else:
-                            trade_budget = self.available_balance * config.TRADE_BUDGET_PCT
-                            raw_quantity = int(trade_budget / limit_price)
-                            quantity = min(raw_quantity, config.MAX_CONTRACTS_PER_TRADE, remaining_exposure)
-                            
-                            if quantity < 1:
+                            actual_pos_size = state.positions.get(executing_contract_id, 0)
+                            remaining_exposure = config.MAX_EXPOSURE_PER_EVENT - actual_pos_size
+                            if remaining_exposure <= 0:
                                 should_decrement = True
                             else:
-                                total_cost = Decimal(quantity) * limit_price
-                                self.available_balance -= total_cost
-                                self.capital_in_flight += total_cost
+                                trade_budget = self.available_balance * config.TRADE_BUDGET_PCT
+                                raw_quantity = int(trade_budget / limit_price)
+                                quantity = min(raw_quantity, config.MAX_CONTRACTS_PER_TRADE, remaining_exposure)
                                 
-                                state.position_sides[executing_contract_id] = trade_side
-                                state.positions[executing_contract_id] = actual_pos_size + quantity
-                                state.cooldown_until = current_time + 15.0
-                                self.state_sequence += 1
+                                if quantity < 30:
+                                    should_decrement = True
+                                else:
+                                    total_cost = Decimal(quantity) * limit_price
+                                    self.available_balance -= total_cost
+                                    self.capital_in_flight += total_cost
+                                    
+                                    state.position_sides[executing_contract_id] = trade_side
+                                    state.positions[executing_contract_id] = actual_pos_size + quantity
+                                    state.last_traded_event = executing_contract_id
+                                    state.cooldown_until = current_time + 15.0
+                                    self.state_sequence += 1
+                                    local_mutated = True
                 
                 if should_decrement:
-                    state.cooldown_until = 0.0
                     return
                 
                 logger.warning(f"[{asset_symbol}] BINANCE LIQUIDATION SIGNAL (${notional:,.2f})! Ask: ${best_ask:.2f} | Sniping {quantity} contracts.")
-                
-                slot_acquired = False
                 
                 exec_task = asyncio.create_task(
                     self.execute_and_hold_entry(
@@ -2230,14 +2310,20 @@ class LiveTradingEngine:
                 )
                 self._pending_tasks.add(exec_task)
                 exec_task.add_done_callback(self._handle_task_done)
+                slot_acquired = False
+            except Exception as inner_e:
+                logger.error("Liquidation execution fault", exc_info=True)
+                if 'exec_task' in locals() and not exec_task.done():
+                    exec_task.cancel()
+                if local_mutated and slot_acquired:
+                    await asyncio.shield(self._update_local_state(total_cost, -total_cost, state, executing_contract_id, -quantity))
+                raise
             finally:
                 if slot_acquired:
-                    await self._decrement_trade_cap()
+                    await asyncio.shield(self._decrement_trade_cap())
                 
         except Exception as e:
             logger.error("Liquidation processing fault", exc_info=True) 
-            if 'state' in locals() and state:
-                state.cooldown_until = 0.0
 
 # ==========================================
 # ASYNC QUEUES
@@ -2246,7 +2332,7 @@ async def coinbase_websocket_consumer(engine: LiveTradingEngine, queue: asyncio.
     uri = "wss://ws-feed.exchange.coinbase.com" 
     subscribe_message = {
         "type": "subscribe",
-        "product_ids": ["BTC-USD", "HYPE-USD", "SOL-USD"],
+        "product_ids": ["BTC-USD", "HYPE-USD", "SOL-USD", "ETH-USD", "DOGE-USD"],
         "channels": ["ticker"]
     }
 
@@ -2257,7 +2343,7 @@ async def coinbase_websocket_consumer(engine: LiveTradingEngine, queue: asyncio.
         reset_done = False
         try:
             async with websockets.connect(uri, ssl=GLOBAL_SSL_CONTEXT, max_size=1048576, max_queue=256) as ws:
-                logger.info("Connected to Coinbase Live Spot Feed.")
+                logger.debug("Connected to Coinbase Live Spot Feed.")
                 await ws.send(orjson.dumps(subscribe_message).decode('utf-8'))
                 
                 async for message in ws:
@@ -2307,7 +2393,7 @@ async def binance_websocket_consumer(engine: LiveTradingEngine, queue: asyncio.Q
         reset_done = False
         try:
             async with websockets.connect(uri, ssl=GLOBAL_SSL_CONTEXT, max_size=1048576, max_queue=256) as ws:
-                logger.info("Connected to Binance Futures Feed.")
+                logger.debug("Connected to Binance Futures Feed.")
                 async for message in ws:
                     if engine.shutting_down: break
                     if not reset_done and time.time() - conn_start > 10.0:
@@ -2369,7 +2455,7 @@ async def kalshi_websocket_consumer(engine: LiveTradingEngine):
             
             # Connect using standard websockets client
             async with websockets.connect(uri, extra_headers=headers, ssl=GLOBAL_SSL_CONTEXT, max_size=1048576, max_queue=256) as ws:
-                logger.info("Connected to Kalshi Private WebSocket Feed.")
+                logger.debug("Connected to Kalshi Private WebSocket Feed.")
                 
                 # Subscribe to private fill feed
                 sub_message = {
@@ -2394,8 +2480,13 @@ async def kalshi_websocket_consumer(engine: LiveTradingEngine):
                             fill_data = msg.get("msg")
                             if isinstance(fill_data, dict):
                                 order_id = fill_data.get("order_id")
-                                if order_id and order_id in engine.active_tp_orders:
-                                    await engine.active_tp_orders[order_id].put(fill_data)
+                                if order_id:
+                                    if order_id in engine.active_tp_orders:
+                                        await engine.active_tp_orders[order_id].put(fill_data)
+                                    else:
+                                        engine.orphan_fills.setdefault(order_id, []).append(fill_data)
+                                        if len(engine.orphan_fills) > 50:
+                                            engine.orphan_fills.pop(next(iter(engine.orphan_fills)))
                     except Exception as pe:
                         logger.warning(f"Error parsing Kalshi WS frame: {pe}")
                     
@@ -2488,12 +2579,13 @@ if __name__ == "__main__":
                 logger.warning("!!! INITIALIZING LIVE TRADING BROKER !!!")
                 broker = LiveKalshiBroker(key_id=key_id, private_key=private_key, paper_trade=False)
             else:
-                logger.info("Initializing PAPER TRADING Broker.")
+                logger.debug("Initializing PAPER TRADING Broker.")
                 broker = LiveKalshiBroker(key_id=key_id, private_key=private_key, paper_trade=True)
             del private_key
+            del key_id
             gc.collect()
         else:
-            logger.info("Initializing SIMULATION Broker.")
+            logger.debug("Initializing SIMULATION Broker.")
             broker = SimExecutionBroker()
 
         await broker.start()
@@ -2536,7 +2628,7 @@ if __name__ == "__main__":
         except Exception as e:
             log_exception_group(e)
         finally:
-            logger.info("Executing final engine shutdown protocols...")
+            logger.debug("Executing final engine shutdown protocols...")
             if health_runner:
                 try:
                     await health_runner.cleanup()
@@ -2548,4 +2640,4 @@ if __name__ == "__main__":
     try: 
         asyncio.run(main())
     except KeyboardInterrupt: 
-        logger.info("Bot halted manually.")
+        logger.debug("Bot halted manually.")

@@ -68,9 +68,13 @@ impl FastIndicators {
             let current_gain = if diff > 0.0 { diff } else { 0.0 };
             let current_loss = if diff < 0.0 { diff.abs() } else { 0.0 };
 
-            if self.count <= self.period + 1 && self.avg_gain == 0.0 && self.avg_loss == 0.0 {
-                self.avg_gain = current_gain;
-                self.avg_loss = current_loss;
+            if self.count <= self.period + 1 {
+                self.avg_gain += current_gain;
+                self.avg_loss += current_loss;
+                if self.count == self.period + 1 {
+                    self.avg_gain /= self.period as f64;
+                    self.avg_loss /= self.period as f64;
+                }
             } else {
                 let p = self.period as f64;
                 self.avg_gain = (self.avg_gain * (p - 1.0) + current_gain) / p;
@@ -114,9 +118,13 @@ impl FastIndicators {
             let current_gain = if diff > 0.0 { diff } else { 0.0 };
             let current_loss = if diff < 0.0 { diff.abs() } else { 0.0 };
 
-            if self.count <= self.period + 1 && self.avg_gain == 0.0 && self.avg_loss == 0.0 {
-                self.avg_gain = current_gain;
-                self.avg_loss = current_loss;
+            if self.count <= self.period + 1 {
+                self.avg_gain += current_gain;
+                self.avg_loss += current_loss;
+                if self.count == self.period + 1 {
+                    self.avg_gain /= self.period as f64;
+                    self.avg_loss /= self.period as f64;
+                }
             } else {
                 let p = self.period as f64;
                 self.avg_gain = (self.avg_gain * (p - 1.0) + current_gain) / p;
