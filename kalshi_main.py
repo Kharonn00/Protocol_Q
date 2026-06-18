@@ -2040,8 +2040,8 @@ class LiveTradingEngine:
                 logger.critical(f"[{contract_id}] API Execution dropped. Releasing slot natively.")
                 await self._update_local_state(locked_capital, -locked_capital, state, contract_id, -quantity)
 
-        except Exception as e:
-            logger.critical(f"[{contract_id}] Unhandled exception in entry manager. Forcing release.", exc_info=True)
+        except (Exception, asyncio.CancelledError) as e:
+            logger.critical(f"[{contract_id}] Unhandled exception or cancellation in entry manager. Forcing release.", exc_info=True)
             if locked_capital > 0:
                 if not order_id:
                     await self._update_local_state(locked_capital, -locked_capital, state, contract_id, -quantity)
@@ -2189,6 +2189,7 @@ class LiveTradingEngine:
                                                         state.positions[executing_contract_id] = state.positions.get(executing_contract_id, 0) + quantity
                                                         state.last_traded_event = executing_contract_id # REINSTATED 1 TRADE LIMIT
                                                         state.cooldown_until = current_time + 15.0
+                                                        self.state_sequence += 1
                                                         local_mutated = True
                                                     else:
                                                         should_decrement = True
@@ -2205,6 +2206,11 @@ class LiveTradingEngine:
                                         slot_acquired = False
                         except Exception as e:
                             logger.error("DOGE Theta Harvester fault", exc_info=True)
+                            if 'exec_task' in locals():
+                                slot_acquired = False
+                                local_mutated = False
+                                if not exec_task.done():
+                                    exec_task.cancel()
                             if local_mutated and slot_acquired:
                                 await asyncio.shield(self._update_local_state(total_cost, -total_cost, state, executing_contract_id, -quantity))
                                 if getattr(state, "last_traded_event", "") == executing_contract_id:
@@ -2317,8 +2323,11 @@ class LiveTradingEngine:
             slot_acquired = False
         except Exception as e:
             logger.error("Z-Score Momentum processing fault", exc_info=True) 
-            if 'exec_task' in locals() and not exec_task.done():
-                exec_task.cancel()
+            if 'exec_task' in locals():
+                slot_acquired = False
+                local_mutated = False
+                if not exec_task.done():
+                    exec_task.cancel()
             if local_mutated and slot_acquired:
                 # Revert leaked local balance if task creation failed
                 await asyncio.shield(self._update_local_state(total_cost, -total_cost, state, executing_contract_id, -quantity))
@@ -2472,8 +2481,11 @@ class LiveTradingEngine:
                 slot_acquired = False
             except Exception as inner_e:
                 logger.error("Liquidation execution fault", exc_info=True)
-                if 'exec_task' in locals() and not exec_task.done():
-                    exec_task.cancel()
+                if 'exec_task' in locals():
+                    slot_acquired = False
+                    local_mutated = False
+                    if not exec_task.done():
+                        exec_task.cancel()
                 if local_mutated and slot_acquired:
                     await asyncio.shield(self._update_local_state(total_cost, -total_cost, state, executing_contract_id, -quantity))
                     if getattr(state, "last_traded_event", "") == executing_contract_id:
@@ -2615,7 +2627,7 @@ async def kalshi_websocket_consumer(engine: LiveTradingEngine):
             }
             
             # Connect using standard websockets client
-            async with websockets.connect(uri, extra_headers=headers, ssl=GLOBAL_SSL_CONTEXT, max_size=1048576, max_queue=256) as ws:
+            async with websockets.connect(uri, additional_headers=headers, ssl=GLOBAL_SSL_CONTEXT, max_size=1048576, max_queue=256) as ws:
                 logger.debug("Connected to Kalshi Private WebSocket Feed.")
                 
                 # Subscribe to private fill feed
