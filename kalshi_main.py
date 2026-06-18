@@ -1249,6 +1249,7 @@ class LiveTradingEngine:
         self.last_sync_time: float = 0.0
         self.last_telemetry_log_time: float = 0.0  
         self.state_sequence: int = 0
+        self.macro_trend: Dict[str, str] = {}
         
         self.active_trade_count: int = 0
         self._binance_events_received: int = 0 
@@ -1515,6 +1516,64 @@ class LiveTradingEngine:
                 logger.error(f"[CIRCUIT BREAKER] Critical calendar update routine failure: {type(e).__name__}")
                 
             await asyncio.sleep(21600)  # Refresh every 6 hours
+
+    async def sync_macro_trend_loop(self):
+        """Fetches the 4-hour trend for major assets using Coinbase REST API."""
+        resolver = SafeResolver()
+        connector = aiohttp.TCPConnector(ssl=GLOBAL_SSL_CONTEXT, resolver=resolver)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            while not self.shutting_down:
+                try:
+                    for asset in ["BTC-USD", "SOL-USD", "ETH-USD", "DOGE-USD"]:
+                        try:
+                            url = f"https://api.exchange.coinbase.com/products/{asset}/candles?granularity=3600"
+                            if not await is_safe_destination_async(url): continue
+                            
+                            headers = {"User-Agent": "KalshiQuantEngine/1.0", "Accept": "application/json"}
+                            timeout = aiohttp.ClientTimeout(total=5.0)
+                            async with session.get(url, headers=headers, timeout=timeout) as response:
+                                if response.status == 200:
+                                    body_bytes = await response.content.read(524288)
+                                    if not body_bytes: continue
+                                    data = orjson.loads(body_bytes)
+                                    if len(data) >= 4:
+                                        current_close = float(data[0][4])
+                                        old_open = float(data[3][3])
+                                        if current_close > old_open * 1.002:
+                                            self.macro_trend[asset] = "UP"
+                                        elif current_close < old_open * 0.998:
+                                            self.macro_trend[asset] = "DOWN"
+                                        else:
+                                            self.macro_trend[asset] = "FLAT"
+                        except Exception as e:
+                            logger.debug(f"[{asset}] Macro sync internal error: {type(e).__name__}")
+                    
+                    try:
+                        url = "https://fapi.binance.com/fapi/v1/klines?symbol=HYPEUSDT&interval=1h&limit=4"
+                        if await is_safe_destination_async(url):
+                            headers = {"User-Agent": "KalshiQuantEngine/1.0", "Accept": "application/json"}
+                            timeout = aiohttp.ClientTimeout(total=5.0)
+                            async with session.get(url, headers=headers, timeout=timeout) as response:
+                                if response.status == 200:
+                                    body_bytes = await response.content.read(524288)
+                                    if not body_bytes: pass
+                                    else:
+                                        data = orjson.loads(body_bytes)
+                                        if len(data) >= 4:
+                                            current_close = float(data[-1][4])
+                                            old_open = float(data[0][1])
+                                            if current_close > old_open * 1.002:
+                                                self.macro_trend["HYPE-USD"] = "UP"
+                                            elif current_close < old_open * 0.998:
+                                                self.macro_trend["HYPE-USD"] = "DOWN"
+                                            else:
+                                                self.macro_trend["HYPE-USD"] = "FLAT"
+                    except Exception as e:
+                        logger.debug(f"[HYPE-USD] Macro sync internal error: {type(e).__name__}")
+                except Exception as e:
+                    logger.warning(f"[MACRO TREND] Sync failed: {type(e).__name__}")
+                
+                await asyncio.sleep(1800)
 
     async def _monitor_take_profit(self, state: AssetState, contract_id: str, side: str, entry_price: Decimal, quantity: int, seconds_left: float):
         """Asynchronous O(1) Background Task: Laddered Take-Profit with adaptive pricing."""
@@ -2068,15 +2127,113 @@ class LiveTradingEngine:
         if state.tick_count < config.MIN_EMA_TICKS: return
         
         z_score = state.fast_indicators.get_z_score()
+        seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
+
+        # -------------------------------------------------------------
+        # STRATEGY 3: DOGE THETA HARVESTER
+        # -------------------------------------------------------------
+        if product_id == "DOGE-USD":
+            if not state.active_contract_id: return
+            if 120.0 <= seconds_left <= 300.0:
+                # Volatility gate (near zero Z-score implies dead market)
+                if z_score == 0.0 or abs(z_score) < 0.5:
+                    executing_contract_id = state.active_contract_id
+                    if executing_contract_id == getattr(state, "last_traded_event", ""): pass # Let it fall through to Strategy 2
+                    else:
+                        slot_acquired = False
+                        local_mutated = False
+                        try:
+                            async with self.trade_cap_lock:
+                                if self.active_trade_count >= config.MAX_CONCURRENT_TRADES: pass
+                                else:
+                                    self.active_trade_count += 1
+                                    slot_acquired = True
+                                
+                            if slot_acquired:
+                                best_yes_vals = await self.broker.get_best_bid_ask(executing_contract_id, "YES")
+                                best_no_vals = await self.broker.get_best_bid_ask(executing_contract_id, "NO")
+                                
+                                trade_side = None
+                                limit_price = Decimal("0.00")
+                                
+                                if best_yes_vals and Decimal("0.85") <= best_yes_vals[1] <= Decimal("0.95"):
+                                    trade_side = "YES"
+                                    limit_price = best_yes_vals[1]
+                                elif best_no_vals and Decimal("0.85") <= best_no_vals[1] <= Decimal("0.95"):
+                                    trade_side = "NO"
+                                    limit_price = best_no_vals[1]
+                                    
+                                if trade_side:
+                                    current_time = time.time()
+                                    seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
+                                    if not (120.0 <= seconds_left <= 300.0) or executing_contract_id != state.active_contract_id:
+                                        should_decrement = True
+                                    else:
+                                        should_decrement = False
+                                        async with self.balance_lock:
+                                            if executing_contract_id == getattr(state, "last_traded_event", ""):
+                                                should_decrement = True
+                                            else:
+                                                trade_budget = self.available_balance * config.TRADE_BUDGET_PCT
+                                                raw_quantity = int(trade_budget / limit_price)
+                                                quantity = min(raw_quantity, config.MAX_CONTRACTS_PER_TRADE, 50) # Harvester max 50 contracts
+                                                
+                                                if quantity < 30: # STRICT 30-CONTRACT MINIMUM FOR FEE STRUCTURE
+                                                    should_decrement = True
+                                                else:
+                                                    total_cost = Decimal(quantity) * limit_price
+                                                    if self.available_balance >= total_cost:
+                                                        self.available_balance -= total_cost
+                                                        self.capital_in_flight += total_cost
+                                                        state.position_sides[executing_contract_id] = trade_side
+                                                        state.positions[executing_contract_id] = state.positions.get(executing_contract_id, 0) + quantity
+                                                        state.last_traded_event = executing_contract_id # REINSTATED 1 TRADE LIMIT
+                                                        state.cooldown_until = current_time + 15.0
+                                                        local_mutated = True
+                                                    else:
+                                                        should_decrement = True
+                                                    
+                                    if not should_decrement:
+                                        logger.warning(f"[{product_id}] THETA HARVESTER ACTIVE! Ask: ${limit_price:.2f} | Sniping {quantity} {trade_side} contracts.")
+                                        exec_task = asyncio.create_task(
+                                            self.execute_and_hold_entry(
+                                                state, executing_contract_id, trade_side, limit_price, quantity, total_cost, seconds_left
+                                            )
+                                        )
+                                        self._pending_tasks.add(exec_task)
+                                        exec_task.add_done_callback(self._handle_task_done)
+                                        slot_acquired = False
+                        except Exception as e:
+                            logger.error("DOGE Theta Harvester fault", exc_info=True)
+                            if local_mutated and slot_acquired:
+                                await asyncio.shield(self._update_local_state(total_cost, -total_cost, state, executing_contract_id, -quantity))
+                                if getattr(state, "last_traded_event", "") == executing_contract_id:
+                                    state.last_traded_event = ""
+                        finally:
+                            if slot_acquired:
+                                await asyncio.shield(self._decrement_trade_cap())
+            # Removed unconditional `return` here so DOGE can fall through to Strategy 2 (Z-Score Breakout) if Theta Harvester conditions aren't met
+            
+        # -------------------------------------------------------------
+        # STRATEGY 2: TREND-FILTERED SNIPER
+        # -------------------------------------------------------------
         if abs(z_score) < 2.5: return
 
         if not state.active_contract_id: return
         
-        seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
         # The Golden Window: 8 minutes to 3 minutes remaining
         if seconds_left < 180.0 or seconds_left > 480.0: return
         
         trade_side = "YES" if z_score > 0 else "NO"
+        
+        # Apply 4-Hour Macro Trend Shield
+        macro = self.macro_trend.get(product_id, "FLAT")
+        if trade_side == "YES" and macro == "DOWN":
+            logger.warning(f"[{product_id}] Z-Score Breakout (+{z_score:.2f}) BLOCKED by 4H Bearish Trend (Bull Trap Prevented).")
+            return
+        if trade_side == "NO" and macro == "UP":
+            logger.warning(f"[{product_id}] Z-Score Breakout ({z_score:.2f}) BLOCKED by 4H Bullish Trend (Bear Trap Prevented).")
+            return
         executing_contract_id = state.active_contract_id
         
         # One trade per asset per event guard
@@ -2165,6 +2322,8 @@ class LiveTradingEngine:
             if local_mutated and slot_acquired:
                 # Revert leaked local balance if task creation failed
                 await asyncio.shield(self._update_local_state(total_cost, -total_cost, state, executing_contract_id, -quantity))
+                if getattr(state, "last_traded_event", "") == executing_contract_id:
+                    state.last_traded_event = ""
         finally:
             if slot_acquired:
                 await asyncio.shield(self._decrement_trade_cap())
@@ -2317,6 +2476,8 @@ class LiveTradingEngine:
                     exec_task.cancel()
                 if local_mutated and slot_acquired:
                     await asyncio.shield(self._update_local_state(total_cost, -total_cost, state, executing_contract_id, -quantity))
+                    if getattr(state, "last_traded_event", "") == executing_contract_id:
+                        state.last_traded_event = ""
                 raise
             finally:
                 if slot_acquired:
@@ -2614,6 +2775,7 @@ if __name__ == "__main__":
                 tg.create_task(engine.sync_balance_loop(), name="sync_balance")
                 tg.create_task(engine.sync_markets_loop(), name="sync_markets")
                 tg.create_task(engine.sync_macro_calendar_loop(), name="sync_macro_calendar")
+                tg.create_task(engine.sync_macro_trend_loop(), name="sync_macro_trend")
                 tg.create_task(coinbase_websocket_consumer(engine, tick_queue), name="consumer")
                 tg.create_task(market_worker_loop(engine, tick_queue), name="worker")
                 tg.create_task(binance_websocket_consumer(engine, binance_queue), name="binance_consumer")
