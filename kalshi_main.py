@@ -68,7 +68,7 @@ class BotConfig:
     })
     MAX_ALLOWED_SPREAD: Decimal = Decimal(os.environ.get("MAX_ALLOWED_SPREAD", "0.25"))
 
-    Z_SCORE_THRESHOLD: float = float(os.environ.get("Z_SCORE_THRESHOLD", "2.5"))
+    Z_SCORE_THRESHOLD: float = float(os.environ.get("Z_SCORE_THRESHOLD", "3.0"))
     MIN_EMA_TICKS: int = int(os.environ.get("MIN_EMA_TICKS", "1000"))
     MAX_FADE_PRICE: Decimal = Decimal(os.environ.get("MAX_FADE_PRICE", "0.52"))
     MAX_PRICE_DEVIATION_PCT: float = 0.15      
@@ -93,6 +93,8 @@ class BotConfig:
     
     # 88% ROI Take-Profit Trap. Entry cost multiplied by 1.88.
     TAKE_PROFIT_ROI: Decimal = Decimal(os.environ.get("TAKE_PROFIT_ROI", "1.88"))
+    
+    DOGE_THETA_MAX_REL_VOLATILITY: Decimal = Decimal(os.environ.get("DOGE_THETA_MAX_REL_VOLATILITY", "0.005"))
 
 config = BotConfig()
 
@@ -259,16 +261,26 @@ class PerformanceTracker:
     def __init__(self):
         self.outcomes: Dict[Tuple[str, int], List] = {}  # (asset, hour) -> [wins, losses, total_pnl]
 
+    _KNOWN_BASES = frozenset({"BTC", "ETH", "SOL", "DOGE", "HYPE"})
+
     def _clean_asset(self, asset_id: str) -> str:
+        """Extract base ticker symbol from Kalshi contract IDs.
+        e.g. 'KXBTC15M-26JUN192015-15' -> 'BTC', 'KXDOGE15M-...' -> 'DOGE'
+        """
         clean = asset_id.upper()
-        if clean.startswith("KX-"):
-            clean = clean[3:]
-        elif clean.startswith("KX"):
-            clean = clean[2:]
-        parts = clean.split('-')
-        symbol = parts[0] if parts else clean
-        match = re.match(r'^[A-Z]+', symbol)
-        return match.group(0) if match else symbol
+        # Strip known Kalshi prefixes
+        for prefix in ("KXCRYPTO-", "KX"):
+            if clean.startswith(prefix):
+                clean = clean[len(prefix):]
+                break
+        # Extract leading alpha characters (e.g. "BTC" from "BTC15M-26JUN...")
+        match = re.match(r'^([A-Z]+)', clean)
+        base = match.group(1) if match else clean
+        # Map to known ticker symbols to prevent partial matches like "BTCM"
+        for known in self._KNOWN_BASES:
+            if base.startswith(known):
+                return known
+        return base
 
     def record(self, asset: str, hour: int, won: bool, pnl: float):
         key = (self._clean_asset(asset), hour)
@@ -661,6 +673,14 @@ class SimExecutionBroker(ExecutionBroker):
             self.simulated_balance -= total_value
             self.positions[key] = self.positions.get(key, 0) + quantity
             return order_id
+        elif action.lower() == "sell":
+            self.simulated_balance += total_value
+            new_qty = max(0, self.positions.get(key, 0) - quantity)
+            if new_qty <= 0:
+                self.positions.pop(key, None)
+            else:
+                self.positions[key] = new_qty
+            return order_id
         return None
 
     async def get_positions(self) -> Optional[Dict[str, Tuple[int, str]]]:
@@ -928,19 +948,27 @@ class LiveKalshiBroker(ExecutionBroker):
                     if ob_fp:
                         yes_bids = ob_fp.get("yes_dollars", [])
                         no_bids = ob_fp.get("no_dollars", [])
-                        if not yes_bids or not no_bids: return None
-                        best_yes_bid = safe_decimal(yes_bids[0][0])
-                        best_yes_qty = safe_int(yes_bids[0][1])
-                        best_no_bid = safe_decimal(no_bids[0][0])
-                        best_no_qty = safe_int(no_bids[0][1])
+                        valid_yes_bids = [b for b in yes_bids if isinstance(b, (list, tuple)) and len(b) >= 2]
+                        valid_no_bids = [b for b in no_bids if isinstance(b, (list, tuple)) and len(b) >= 2]
+                        if not valid_yes_bids or not valid_no_bids: return None
+                        yes_bids_sorted = sorted(valid_yes_bids, key=lambda x: safe_decimal(x[0]))
+                        no_bids_sorted = sorted(valid_no_bids, key=lambda x: safe_decimal(x[0]))
+                        best_yes_bid = safe_decimal(yes_bids_sorted[-1][0])
+                        best_yes_qty = safe_int(yes_bids_sorted[-1][1])
+                        best_no_bid = safe_decimal(no_bids_sorted[-1][0])
+                        best_no_qty = safe_int(no_bids_sorted[-1][1])
                     elif ob_standard:
                         yes_bids = ob_standard.get("yes", [])
                         no_bids = ob_standard.get("no", [])
-                        if not yes_bids or not no_bids: return None
-                        best_yes_bid = safe_decimal(yes_bids[0][0]) / Decimal("100.00")
-                        best_yes_qty = safe_int(yes_bids[0][1])
-                        best_no_bid = safe_decimal(no_bids[0][0]) / Decimal("100.00")
-                        best_no_qty = safe_int(no_bids[0][1])
+                        valid_yes_bids = [b for b in yes_bids if isinstance(b, (list, tuple)) and len(b) >= 2]
+                        valid_no_bids = [b for b in no_bids if isinstance(b, (list, tuple)) and len(b) >= 2]
+                        if not valid_yes_bids or not valid_no_bids: return None
+                        yes_bids_sorted = sorted(valid_yes_bids, key=lambda x: safe_decimal(x[0]))
+                        no_bids_sorted = sorted(valid_no_bids, key=lambda x: safe_decimal(x[0]))
+                        best_yes_bid = safe_decimal(yes_bids_sorted[-1][0]) / Decimal("100.00")
+                        best_yes_qty = safe_int(yes_bids_sorted[-1][1])
+                        best_no_bid = safe_decimal(no_bids_sorted[-1][0]) / Decimal("100.00")
+                        best_no_qty = safe_int(no_bids_sorted[-1][1])
                     else: return None
                     
                     if side.lower() == "yes": 
@@ -1250,6 +1278,7 @@ class LiveTradingEngine:
         self.last_telemetry_log_time: float = 0.0  
         self.state_sequence: int = 0
         self.macro_trend: Dict[str, str] = {}
+        self.last_blocked_log_time: Dict[str, float] = {}
         
         self.active_trade_count: int = 0
         self._binance_events_received: int = 0 
@@ -1332,6 +1361,12 @@ class LiveTradingEngine:
             pass
         if details.get("status") == "executed": return requested_qty
         return 0
+
+    async def _safe_shield(self, coro):
+        task = asyncio.create_task(coro)
+        self._pending_tasks.add(task)
+        task.add_done_callback(self._handle_task_done)
+        return await asyncio.shield(task)
 
     async def _decrement_trade_cap(self):
         async with self.trade_cap_lock:
@@ -1575,101 +1610,202 @@ class LiveTradingEngine:
                 
                 await asyncio.sleep(1800)
 
-    async def _monitor_take_profit(self, state: AssetState, contract_id: str, side: str, entry_price: Decimal, quantity: int, seconds_left: float):
+    async def _monitor_take_profit(self, state: AssetState, contract_id: str, side: str, entry_price: Decimal, quantity: int, seconds_left: float, hold_to_settle: bool = False, strike_price: Optional[float] = None):
         """Asynchronous O(1) Background Task: Laddered Take-Profit with adaptive pricing."""
         if quantity <= 0: return
+        target_strike = strike_price if strike_price is not None else getattr(state, 'strike_price', 0.0)
+        total_filled = 0
+        total_proceeds = Decimal("0.00")
+        
+        # Track previously reported fills per order to update local state incrementally
+        order_ids = []
+        
         try:
-            min_tp = config.MIN_TP_ROI
-            max_tp = config.MAX_TP_ROI  # 1.85 = 85% ROI
-            clamped_seconds = max(180.0, min(600.0, float(seconds_left)))
-            dynamic_multiplier = min_tp + Decimal(str((clamped_seconds - 180.0) / 420.0)) * (max_tp - min_tp)
-            
-            # Adaptive TP: Check current orderbook depth to anchor TP to real liquidity
-            tp_check = await self.broker.get_best_bid_ask(contract_id, side)
-            if tp_check:
-                current_best_bid, _, _, _ = tp_check
-                max_realistic_tp = max(
-                    entry_price + Decimal("0.01"), 
-                    entry_price * Decimal("1.02"), 
-                    current_best_bid * Decimal("1.30")
-                )
-            else:
-                max_realistic_tp = Decimal("0.99")
-            
-            # === LADDERED EXIT STRATEGY ===
-            # Tranche 1 (40%): Conservative — quick-fill exit
-            t1_qty = max(1, round(quantity * 0.40))
-            raw_t1 = (entry_price * Decimal("1.50")).quantize(Decimal("0.01"), rounding=ROUND_UP)  # 50% ROI
-            t1_price = min(Decimal("0.99"), max_realistic_tp, raw_t1)
-            
-            # Tranche 2 (35%): Dynamic multiplier target
-            t2_qty = max(0, round(quantity * 0.35))
-            if t1_qty + t2_qty > quantity:
-                t2_qty = quantity - t1_qty
-            raw_t2 = (entry_price * dynamic_multiplier).quantize(Decimal("0.01"), rounding=ROUND_UP)
-            t2_price = min(Decimal("0.99"), max(t1_price + Decimal("0.01"), raw_t2))
-            
-            # Tranche 3 (25%): Aggressive moonshot
-            t3_qty = max(0, quantity - t1_qty - t2_qty)
-            raw_t3 = (entry_price * Decimal("1.95")).quantize(Decimal("0.01"), rounding=ROUND_UP)  # 95% ROI
-            t3_price = min(Decimal("0.99"), max(t2_price + Decimal("0.01"), raw_t3))
-            
-            safe_contract_id = urllib.parse.quote(contract_id, safe='')
-            
-            # Minor execution delay to allow Kalshi portfolio settlement
-            await asyncio.sleep(0.5)
-            
-            # Place all tranches
-            order_ids = []
-            tranches = []
-            if t1_qty > 0:
-                tranches.append((t1_qty, t1_price, "T1-conservative"))
-            if t2_qty > 0:
-                tranches.append((t2_qty, t2_price, "T2-dynamic"))
-            if t3_qty > 0:
-                tranches.append((t3_qty, t3_price, "T3-aggressive"))
-            
-            for tq, tp, label in tranches:
-                tp_client_oid = f"tp-{label}-{uuid.uuid4().hex[:12]}"
-                logger.info(f"[{contract_id}] Routing {label} Take-Profit: Sell {tq} '{side.upper()}' @ ${tp:.2f}")
-                tp_order_id = await self.broker.execute_trade(
-                    action="sell",
-                    contract_id=contract_id,
-                    side=side,
-                    limit_price=tp,
-                    quantity=tq,
-                    client_order_id=tp_client_oid
-                )
-                if tp_order_id:
-                    self.active_tp_orders[tp_order_id] = asyncio.Queue()  # Register immediately to prevent TOCTOU fill loss
-                    if tp_order_id in self.orphan_fills:
-                        for fill_msg in self.orphan_fills.pop(tp_order_id):
-                            self.active_tp_orders[tp_order_id].put_nowait(fill_msg)
-                    order_ids.append((tp_order_id, tq, tp, label))
+            if not hold_to_settle:
+                min_tp = config.MIN_TP_ROI
+                max_tp = config.MAX_TP_ROI  # 1.85 = 85% ROI
+                clamped_seconds = max(180.0, min(600.0, float(seconds_left)))
+                dynamic_multiplier = min_tp + Decimal(str((clamped_seconds - 180.0) / 420.0)) * (max_tp - min_tp)
+                
+                # Adaptive TP: Check current orderbook depth to anchor TP to real liquidity
+                tp_check = await self.broker.get_best_bid_ask(contract_id, side)
+                if tp_check:
+                    current_best_bid, _, _, _ = tp_check
+                    max_realistic_tp = max(
+                        entry_price + Decimal("0.01"), 
+                        entry_price * Decimal("1.02"), 
+                        current_best_bid * Decimal("1.30")
+                    )
                 else:
-                    logger.warning(f"[{contract_id}] Failed to route {label} TP order.")
+                    max_realistic_tp = Decimal("0.99")
+                
+                # === LADDERED EXIT STRATEGY ===
+                t1_qty = max(1, round(quantity * 0.40))
+                raw_t1 = (entry_price * Decimal("1.50")).quantize(Decimal("0.01"), rounding=ROUND_UP)  # 50% ROI
+                t1_price = min(Decimal("0.99"), max_realistic_tp, raw_t1)
+                
+                t2_qty = max(0, round(quantity * 0.35))
+                if t1_qty + t2_qty > quantity:
+                    t2_qty = quantity - t1_qty
+                raw_t2 = (entry_price * dynamic_multiplier).quantize(Decimal("0.01"), rounding=ROUND_UP)
+                t2_price = min(Decimal("0.99"), max(t1_price + Decimal("0.01"), raw_t2))
+                
+                t3_qty = max(0, quantity - t1_qty - t2_qty)
+                raw_t3 = (entry_price * Decimal("1.95")).quantize(Decimal("0.01"), rounding=ROUND_UP)  # 95% ROI
+                t3_price = min(Decimal("0.99"), max(t2_price + Decimal("0.01"), raw_t3))
+                
+                # Minor execution delay to allow Kalshi portfolio settlement
+                await asyncio.sleep(0.5)
+                
+                # Place all tranches
+                tranches = []
+                if t1_qty > 0:
+                    tranches.append((t1_qty, t1_price, "T1-conservative"))
+                if t2_qty > 0:
+                    tranches.append((t2_qty, t2_price, "T2-dynamic"))
+                if t3_qty > 0:
+                    tranches.append((t3_qty, t3_price, "T3-aggressive"))
+
+                if len(tranches) > 0 and all(tp == Decimal("0.99") for _, tp, _ in tranches):
+                    logger.info(f"[{contract_id}] All TP tranches maxed at $0.99. Bypassing TP routing and falling back to Hold-to-Settle.")
+                    hold_to_settle = True
+
+            if hold_to_settle:
+                logger.info(f"[{contract_id}] 💎 Theta Harvester active. Holding {quantity} contracts to settlement to avoid maker/taker fees.")
             
-            if not order_ids:
-                logger.warning(f"[{contract_id}] All TP tranches failed. Holding to expiration.")
+                sleep_time = max(0.0, state.expiration_time - time.time() - 2.0) if state.expiration_time else max(0.0, seconds_left - 2.0)
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
+                    
+                # Perform a final orderbook check 2 seconds before the buzzer
+                tp_check = await self.broker.get_best_bid_ask(contract_id, side)
+                won = False
+                net_pnl = Decimal("0.00") - (Decimal(str(quantity)) * entry_price)
+                if tp_check:
+                    final_bid, _, _, _ = tp_check
+                    if final_bid >= Decimal("0.90"):
+                        logger.info(f"[{contract_id}] 🏆 THE BUZZER: Final '{side.upper()}' bid is ${final_bid:.2f}. WIN HIGHLY PROBABLE! Settlement pending.")
+                        payout = Decimal(str(quantity)) * Decimal("1.00")
+                        net_pnl = payout - (Decimal(str(quantity)) * entry_price)
+                        won = True
+                        if hasattr(self.broker, 'simulated_balance'):
+                            self.broker.simulated_balance += payout
+                            logger.info(f"[{contract_id}] 💸 PAPER PAYOUT: Added ${payout:.2f} to simulated balance.")
+                            await self._safe_shield(self._update_local_state(Decimal("0.00"), Decimal("0.00")))
+                        elif getattr(self.broker, 'paper_trade', False) and hasattr(self.broker, '_paper_balance'):
+                            self.broker._paper_balance += payout
+                            logger.info(f"[{contract_id}] 💸 PAPER PAYOUT: Added ${payout:.2f} to paper balance.")
+                            await self._safe_shield(self._update_local_state(Decimal("0.00"), Decimal("0.00")))
+                    elif final_bid <= Decimal("0.10"):
+                        logger.warning(f"[{contract_id}] 💀 THE BUZZER: Final '{side.upper()}' bid is ${final_bid:.2f}. LOSS HIGHLY PROBABLE. Settlement pending.")
+                        won = False
+                    else:
+                        # Fallback to last known price to resolve paper payouts for toss-ups rather than ignoring
+                        logger.info(f"[{contract_id}] ⚖️ THE BUZZER: Final '{side.upper()}' bid is ${final_bid:.2f}. TOSS UP. Settlement pending.")
+                        payout = Decimal(str(quantity)) * final_bid
+                        net_pnl = payout - (Decimal(str(quantity)) * entry_price)
+                        won = net_pnl > 0
+                        if hasattr(self.broker, 'simulated_balance'):
+                            self.broker.simulated_balance += payout
+                            logger.info(f"[{contract_id}] 💸 PAPER PAYOUT (TOSS UP): Added ${payout:.2f} to simulated balance.")
+                            await self._safe_shield(self._update_local_state(Decimal("0.00"), Decimal("0.00")))
+                        elif getattr(self.broker, 'paper_trade', False) and hasattr(self.broker, '_paper_balance'):
+                            self.broker._paper_balance += payout
+                            logger.info(f"[{contract_id}] 💸 PAPER PAYOUT (TOSS UP): Added ${payout:.2f} to paper balance.")
+                            await self._safe_shield(self._update_local_state(Decimal("0.00"), Decimal("0.00")))
+                else:
+                    # Fallback for closed/missing orderbook: resolve settlement using underlying price vs strike if available
+                    logger.info(f"[{contract_id}] Event expired. Orderbook closed. Background settlement watch complete.")
+                    settled_won = None
+                    if state.last_price is not None and target_strike > 0.0:
+                        try:
+                            last_price_dec = Decimal(str(state.last_price))
+                            strike_price_dec = Decimal(str(target_strike))
+                            if side.upper() == "YES":
+                                settled_won = last_price_dec > strike_price_dec
+                            else:
+                                settled_won = last_price_dec <= strike_price_dec
+                        except Exception as ex_settle:
+                            logger.error(f"[{contract_id}] Fallback settlement calculation error: {ex_settle}")
+                            
+                    if settled_won is not None:
+                        if settled_won:
+                            logger.info(f"[{contract_id}] 🏆 SETTLED WIN: Price ${state.last_price} vs Strike ${target_strike} for '{side.upper()}'.")
+                            payout = Decimal(str(quantity)) * Decimal("1.00")
+                            net_pnl = payout - (Decimal(str(quantity)) * entry_price)
+                            won = True
+                            if hasattr(self.broker, 'simulated_balance'):
+                                self.broker.simulated_balance += payout
+                                logger.info(f"[{contract_id}] 💸 PAPER PAYOUT (SETTLED WIN): Added ${payout:.2f} to simulated balance.")
+                                await self._safe_shield(self._update_local_state(Decimal("0.00"), Decimal("0.00")))
+                            elif getattr(self.broker, 'paper_trade', False) and hasattr(self.broker, '_paper_balance'):
+                                self.broker._paper_balance += payout
+                                logger.info(f"[{contract_id}] 💸 PAPER PAYOUT (SETTLED WIN): Added ${payout:.2f} to paper balance.")
+                                await self._safe_shield(self._update_local_state(Decimal("0.00"), Decimal("0.00")))
+                        else:
+                            logger.warning(f"[{contract_id}] 💀 SETTLED LOSS: Price ${state.last_price} vs Strike ${target_strike} for '{side.upper()}'.")
+                            won = False
+                            payout = Decimal("0.00")
+                            net_pnl = Decimal("0.00") - (Decimal(str(quantity)) * entry_price)
+                    else:
+                        if getattr(self.broker, 'paper_trade', False) and entry_price < Decimal("0.50"):
+                            # Assume 50% probability win-rate payout as a baseline fallback for closed books
+                            payout = Decimal(str(quantity)) * Decimal("0.50")
+                            net_pnl = payout - (Decimal(str(quantity)) * entry_price)
+                            won = net_pnl > 0
+                            if hasattr(self.broker, 'simulated_balance'):
+                                self.broker.simulated_balance += payout
+                                await self._safe_shield(self._update_local_state(Decimal("0.00"), Decimal("0.00")))
+                            elif hasattr(self.broker, '_paper_balance'):
+                                self.broker._paper_balance += payout
+                                await self._safe_shield(self._update_local_state(Decimal("0.00"), Decimal("0.00")))
+                
+                current_hour = int(datetime.datetime.now(datetime.timezone.utc).hour)
+                self.performance_tracker.record(contract_id, current_hour, won, float(net_pnl))
                 return
             
-            # (Orders already registered in active_tp_orders dispatch mapping above)
-            
-            # Monitor all tranches until buzzer
-            poll_interval = 5.0
-            elapsed = 0.0
-            timeout = max(0.0, seconds_left - 10.0)
-            total_filled = 0
-            total_proceeds = Decimal("0.00")
-            
-            # Track previously reported fills per order to update local state incrementally
-            last_reported_fill = {oid: 0 for oid, _, _, _ in order_ids}
-            ws_accumulated_fills = {oid: 0 for oid, _, _, _ in order_ids}
-            rest_accumulated_fills = {oid: 0 for oid, _, _, _ in order_ids}
-            completed_orders = set()
-            start_time = time.time()
-            
+            # Inner try...finally block wrapped around routing to guarantee clean registration
             try:
+                for tq, tp, label in tranches:
+                    tp_client_oid = f"tp-{label}-{uuid.uuid4().hex[:12]}"
+                    logger.info(f"[{contract_id}] Routing {label} Take-Profit: Sell {tq} '{side.upper()}' @ ${tp:.2f}")
+                    tp_order_id = await self.broker.execute_trade(
+                        action="sell",
+                        contract_id=contract_id,
+                        side=side,
+                        limit_price=tp,
+                        quantity=tq,
+                        client_order_id=tp_client_oid
+                    )
+                    if tp_order_id:
+                        self.active_tp_orders[tp_order_id] = asyncio.Queue()  # Register immediately to prevent TOCTOU fill loss
+                        if tp_order_id in self.orphan_fills:
+                            for fill_msg in self.orphan_fills.pop(tp_order_id):
+                                self.active_tp_orders[tp_order_id].put_nowait(fill_msg)
+                        order_ids.append((tp_order_id, tq, tp, label))
+                    else:
+                        logger.warning(f"[{contract_id}] Failed to route {label} TP order.")
+                
+                if not order_ids:
+                    logger.warning(f"[{contract_id}] All TP tranches failed. Holding to expiration.")
+                    # W-3 Fix: Record the loss in performance tracker before returning
+                    # (without this, should_trade() never sees failed TP events)
+                    current_hour = int(datetime.datetime.now(datetime.timezone.utc).hour)
+                    total_cost = Decimal(quantity) * entry_price
+                    self.performance_tracker.record(contract_id, current_hour, False, float(-total_cost))
+                    return
+                
+                # Monitor all tranches until buzzer
+                poll_interval = 5.0
+                elapsed = 0.0
+                timeout = max(0.0, seconds_left - 10.0)
+                
+                # Monotonic Unified Accumulator (fixes SEC-01)
+                last_reported_fill = {oid: 0 for oid, _, _, _ in order_ids}
+                accumulated_fills = {oid: 0 for oid, _, _, _ in order_ids}
+                completed_orders = set()
+                start_time = time.time()
+                
                 while time.time() - start_time < timeout and len(completed_orders) < len(order_ids):
                     active_oids = [oid for oid, _, _, _ in order_ids if oid not in completed_orders]
                     if not active_oids:
@@ -1714,16 +1850,18 @@ class LiveTradingEngine:
                                 )
                                 
                                 raw_fills = int(fill_data.get("count", 0))
-                                ws_accumulated_fills[oid] = ws_accumulated_fills.get(oid, 0) + raw_fills
-                                max_known = max(ws_accumulated_fills[oid], rest_accumulated_fills.get(oid, 0))
-                                new_fills = min(max_known - last_reported_fill.get(oid, 0), oqty - last_reported_fill.get(oid, 0))
+                                
+                                # Monotonically accumulate WS fill (incremental count)
+                                accumulated_fills[oid] = accumulated_fills.get(oid, 0) + raw_fills
+                                new_fills = min(accumulated_fills[oid] - last_reported_fill.get(oid, 0), oqty - last_reported_fill.get(oid, 0))
                                 tp_status = fill_data.get("status", "unknown")
                                 
                                 # Incrementally update positions (WS count is incremental)
                                 if new_fills > 0:
                                     total_filled += new_fills
                                     total_proceeds += Decimal(new_fills) * oprice
-                                    await self._update_local_state(Decimal("0.00"), Decimal("0.00"), state, contract_id, -new_fills)
+                                    # Safe shielded call to prevent cancellation drop (fixes SEC-02)
+                                    await self._safe_shield(self._update_local_state(Decimal("0.00"), Decimal("0.00"), state, contract_id, -new_fills))
                                     last_reported_fill[oid] = last_reported_fill.get(oid, 0) + new_fills
                                 
                                 if last_reported_fill[oid] >= oqty or tp_status == "executed":
@@ -1744,15 +1882,16 @@ class LiveTradingEngine:
                                 tp_status = tp_details.get("status", "unknown")
                                 tp_filled_qty = self._get_filled_qty_from_details(tp_details, oqty)
                                 
-                                rest_accumulated_fills[oid] = tp_filled_qty
-                                max_known = max(ws_accumulated_fills.get(oid, 0), rest_accumulated_fills[oid])
-                                new_fills = min(max_known - last_reported_fill.get(oid, 0), oqty - last_reported_fill.get(oid, 0))
+                                # Monotonically merge REST fill (cumulative count)
+                                accumulated_fills[oid] = max(accumulated_fills.get(oid, 0), tp_filled_qty)
+                                new_fills = min(accumulated_fills[oid] - last_reported_fill.get(oid, 0), oqty - last_reported_fill.get(oid, 0))
                                 
                                 if new_fills > 0:
                                     total_filled += new_fills
                                     total_proceeds += Decimal(new_fills) * oprice
-                                    await self._update_local_state(Decimal("0.00"), Decimal("0.00"), state, contract_id, -new_fills)
-                                    last_reported_fill[oid] = tp_filled_qty
+                                    # Safe shielded call to prevent cancellation drop (fixes SEC-02)
+                                    await self._safe_shield(self._update_local_state(Decimal("0.00"), Decimal("0.00"), state, contract_id, -new_fills))
+                                    last_reported_fill[oid] = last_reported_fill.get(oid, 0) + new_fills
                                 
                                 if tp_filled_qty >= oqty or tp_status == "executed":
                                     logger.warning(f"[{contract_id}] 🎯 {olabel} TP HIT (Fallback REST)! Sold {tp_filled_qty}x @ ${oprice:.2f}")
@@ -1762,7 +1901,7 @@ class LiveTradingEngine:
                             except Exception as e:
                                 logger.debug(f"[{contract_id}] Fallback REST poll error: {e}")
             finally:
-                # Cleanup registry
+                # Cleanup registry is guaranteed to run even if order placement loop raises (fixes SEC-03)
                 for oid, _, _, _ in order_ids:
                     self.active_tp_orders.pop(oid, None)
             
@@ -1794,12 +1933,14 @@ class LiveTradingEngine:
                             status = details.get("status", "unknown")
                             if status in ["canceled", "cancelled", "executed"]:
                                 filled = self._get_filled_qty_from_details(details, oqty)
-                                new_fills = filled - last_reported_fill.get(oid, 0)
+                                accumulated_fills[oid] = max(accumulated_fills.get(oid, 0), filled)
+                                new_fills = accumulated_fills[oid] - last_reported_fill.get(oid, 0)
                                 if new_fills > 0:
                                     total_filled += new_fills
                                     total_proceeds += Decimal(new_fills) * oprice
-                                    await self._update_local_state(Decimal("0.00"), Decimal("0.00"), state, contract_id, -new_fills)
-                                    last_reported_fill[oid] = filled
+                                    # Safe shielded call to prevent cancellation drop (fixes SEC-02)
+                                    await self._safe_shield(self._update_local_state(Decimal("0.00"), Decimal("0.00"), state, contract_id, -new_fills))
+                                    last_reported_fill[oid] = accumulated_fills[oid]
                                     logger.info(f"[{contract_id}] {olabel} partial fill at buzzer: {filled}/{oqty}")
                                 break
                         except Exception as ex:
@@ -1825,6 +1966,13 @@ class LiveTradingEngine:
                 
         except Exception as e:
             logger.error(f"[{contract_id}] Unhandled error in Take Profit monitor.", exc_info=True)
+        finally:
+            unfilled = quantity - total_filled
+            if unfilled > 0:
+                # O(1) Memory Cleanup: Resolve simulated positions to prevent dictionary leak on expired settlements
+                if hasattr(self.broker, 'positions') and isinstance(self.broker.positions, dict):
+                    self.broker.positions.pop((contract_id, side.lower()), None)
+                await self._safe_shield(self._update_local_state(Decimal("0.00"), Decimal("0.00"), state, contract_id, -unfilled))
 
     async def paper_fill_dispatcher(self):
         """Background loop for paper trading: simulates incremental order fills and pushes to active_tp_orders."""
@@ -1875,10 +2023,17 @@ class LiveTradingEngine:
             except Exception as e:
                 logger.debug(f"Paper fill dispatcher error: {e}")
             await asyncio.sleep(1.0)
-
-    async def execute_and_hold_entry(self, state: AssetState, contract_id: str, side: str, limit_price: Decimal, quantity: int, total_cost: Decimal, seconds_left: float):
+    async def execute_and_hold_entry(self, state: AssetState, contract_id: str, side: str, limit_price: Decimal, quantity: int, total_cost: Decimal, seconds_left: float, hold_to_settle: bool = False):
+        executing_strike = getattr(state, "strike_price", 0.0)
         order_id = None
         locked_capital = total_cost
+
+        async def release_locked_capital(avail_delta: Decimal, qty_delta: int = 0):
+            nonlocal locked_capital
+            _lc = locked_capital
+            locked_capital = Decimal("0.00")
+            if _lc > 0:
+                await self._safe_shield(self._update_local_state(avail_delta, -_lc, state, contract_id, qty_delta))
 
         try:
             safe_contract_id = urllib.parse.quote(contract_id, safe='')
@@ -1940,30 +2095,29 @@ class LiveTradingEngine:
                         filled_qty = self._get_filled_qty_from_details(details, quantity)
                         
                         if filled_qty == quantity or status == "executed":
-                            await self._update_local_state(Decimal("0.00"), -locked_capital)
+                            await release_locked_capital(Decimal("0.00"))
                             logger.info(f"[{contract_id}] Order filled ({quantity}/{quantity}).")
                             
-                            tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, _extract_fill_price(details, limit_price), quantity, seconds_left))
+                            tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, _extract_fill_price(details, limit_price), quantity, seconds_left, hold_to_settle=hold_to_settle, strike_price=executing_strike))
                             self._pending_tasks.add(tp_task)
                             tp_task.add_done_callback(self._handle_task_done)
                             return
                         elif status in ["canceled", "cancelled"]:
                             unfilled_qty = quantity - filled_qty
                             if unfilled_qty <= 0:
-                                await self._update_local_state(Decimal("0.00"), -locked_capital)
+                                await release_locked_capital(Decimal("0.00"))
                                 logger.info(f"[{contract_id}] Order filled ({quantity}/{quantity}).")
                                 
-                                tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, _extract_fill_price(details, limit_price), quantity, seconds_left))
+                                tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, _extract_fill_price(details, limit_price), quantity, seconds_left, hold_to_settle=hold_to_settle, strike_price=executing_strike))
                                 self._pending_tasks.add(tp_task)
                                 tp_task.add_done_callback(self._handle_task_done)
                                 return
                             else:
                                 refund = Decimal(str(unfilled_qty)) * limit_price
-                                await self._update_local_state(refund, -refund, state, contract_id, -unfilled_qty)
-                                locked_capital -= refund
+                                await release_locked_capital(refund, -unfilled_qty)
                                 logger.info(f"[{contract_id}] Partial Fill ({filled_qty}/{quantity}).")
                                 
-                                tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, _extract_fill_price(details, limit_price), filled_qty, seconds_left))
+                                tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, _extract_fill_price(details, limit_price), filled_qty, seconds_left, hold_to_settle=hold_to_settle, strike_price=executing_strike))
                                 self._pending_tasks.add(tp_task)
                                 tp_task.add_done_callback(self._handle_task_done)
                                 return
@@ -1973,9 +2127,9 @@ class LiveTradingEngine:
                     else:
                         logger.info(f"[{contract_id}] Order filled ({filled_qty}/{quantity}).")
 
-                        await self._update_local_state(Decimal("0.00"), -locked_capital)
+                        await release_locked_capital(Decimal("0.00"))
                         
-                        tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, _extract_fill_price(details, limit_price), filled_qty, seconds_left))
+                        tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, _extract_fill_price(details, limit_price), filled_qty, seconds_left, hold_to_settle=hold_to_settle, strike_price=executing_strike))
                         self._pending_tasks.add(tp_task)
                         tp_task.add_done_callback(self._handle_task_done)
                         
@@ -2004,10 +2158,10 @@ class LiveTradingEngine:
                     filled_qty = self._get_filled_qty_from_details(details, quantity)
 
                     if filled_qty == quantity or status == "executed":
-                        await self._update_local_state(Decimal("0.00"), -locked_capital)
+                        await release_locked_capital(Decimal("0.00"))
                         logger.warning(f"[{contract_id}] Order fully filled prior to cancellation.")
                         
-                        tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, _extract_fill_price(details, limit_price), quantity, seconds_left))
+                        tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, _extract_fill_price(details, limit_price), quantity, seconds_left, hold_to_settle=hold_to_settle, strike_price=executing_strike))
                         self._pending_tasks.add(tp_task)
                         tp_task.add_done_callback(self._handle_task_done)
                         return
@@ -2015,15 +2169,15 @@ class LiveTradingEngine:
                         if filled_qty > 0:
                             unfilled_qty = quantity - filled_qty
                             refund = Decimal(str(unfilled_qty)) * limit_price
-                            await self._update_local_state(refund, -refund, state, contract_id, -unfilled_qty)
+                            await release_locked_capital(refund, -unfilled_qty)
                             logger.warning(f"[{contract_id}] Partially filled ({filled_qty}/{quantity}) prior to cancellation.")
                             
-                            tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, _extract_fill_price(details, limit_price), filled_qty, seconds_left))
+                            tp_task = asyncio.create_task(self._monitor_take_profit(state, contract_id, side, _extract_fill_price(details, limit_price), filled_qty, seconds_left, hold_to_settle=hold_to_settle, strike_price=executing_strike))
                             self._pending_tasks.add(tp_task)
                             tp_task.add_done_callback(self._handle_task_done)
                             return
                         else:
-                            await self._update_local_state(locked_capital, -locked_capital, state, contract_id, -quantity)
+                            await release_locked_capital(locked_capital, -quantity)
                             logger.info(f"[{contract_id}] Order fully cancelled.")
                             return
                     else:
@@ -2038,20 +2192,20 @@ class LiveTradingEngine:
                         self.consecutive_api_failures = 0
 
                 logger.critical(f"[{contract_id}] API Execution dropped. Releasing slot natively.")
-                await self._update_local_state(locked_capital, -locked_capital, state, contract_id, -quantity)
+                await release_locked_capital(locked_capital, -quantity)
 
         except (Exception, asyncio.CancelledError) as e:
             logger.critical(f"[{contract_id}] Unhandled exception or cancellation in entry manager. Forcing release.", exc_info=True)
             if locked_capital > 0:
                 if not order_id:
-                    await self._update_local_state(locked_capital, -locked_capital, state, contract_id, -quantity)
+                    await release_locked_capital(locked_capital, -quantity)
                 else:
                     # Order was placed, but we crashed mid-lifecycle.
                     # Decrement capital_in_flight locally to avoid permanent leakage, and let sync loop reconcile.
-                    await self._update_local_state(Decimal("0.00"), -locked_capital, state, contract_id, -quantity)
+                    await release_locked_capital(Decimal("0.00"), -quantity)
             raise
         finally:
-            await asyncio.shield(self._decrement_trade_cap())
+            await self._safe_shield(self._decrement_trade_cap())
 
     # ==========================================
     # CORE QUANTITATIVE ENGINE: Mean-Reversion
@@ -2135,8 +2289,12 @@ class LiveTradingEngine:
         if product_id == "DOGE-USD":
             if not state.active_contract_id: return
             if 120.0 <= seconds_left <= 300.0:
-                # Volatility gate (near zero Z-score implies dead market)
-                if z_score == 0.0 or abs(z_score) < 0.5:
+                # Volatility gate: verify relative volatility is low and Z-score is near zero
+                mean, upper, lower = state.fast_indicators.get_bollinger_bands()
+                std_dev = (upper - mean) / 2.0
+                rel_std_dev = std_dev / mean if mean > 0.0 else 0.0
+                
+                if rel_std_dev <= float(config.DOGE_THETA_MAX_REL_VOLATILITY) and (z_score == 0.0 or abs(z_score) < 0.5):
                     executing_contract_id = state.active_contract_id
                     if executing_contract_id == getattr(state, "last_traded_event", ""): pass # Let it fall through to Strategy 2
                     else:
@@ -2150,16 +2308,19 @@ class LiveTradingEngine:
                                     slot_acquired = True
                                 
                             if slot_acquired:
-                                best_yes_vals = await self.broker.get_best_bid_ask(executing_contract_id, "YES")
-                                best_no_vals = await self.broker.get_best_bid_ask(executing_contract_id, "NO")
+                                state.cooldown_until = current_time + 15.0
+                                best_yes_vals, best_no_vals = await asyncio.gather(
+                                    self.broker.get_best_bid_ask(executing_contract_id, "YES"),
+                                    self.broker.get_best_bid_ask(executing_contract_id, "NO")
+                                )
                                 
                                 trade_side = None
                                 limit_price = Decimal("0.00")
                                 
-                                if best_yes_vals and Decimal("0.85") <= best_yes_vals[1] <= Decimal("0.95"):
+                                if best_yes_vals and Decimal("0.80") <= best_yes_vals[1] <= Decimal("0.90"):
                                     trade_side = "YES"
                                     limit_price = best_yes_vals[1]
-                                elif best_no_vals and Decimal("0.85") <= best_no_vals[1] <= Decimal("0.95"):
+                                elif best_no_vals and Decimal("0.80") <= best_no_vals[1] <= Decimal("0.90"):
                                     trade_side = "NO"
                                     limit_price = best_no_vals[1]
                                     
@@ -2198,7 +2359,7 @@ class LiveTradingEngine:
                                         logger.warning(f"[{product_id}] THETA HARVESTER ACTIVE! Ask: ${limit_price:.2f} | Sniping {quantity} {trade_side} contracts.")
                                         exec_task = asyncio.create_task(
                                             self.execute_and_hold_entry(
-                                                state, executing_contract_id, trade_side, limit_price, quantity, total_cost, seconds_left
+                                                state, executing_contract_id, trade_side, limit_price, quantity, total_cost, seconds_left, hold_to_settle=True
                                             )
                                         )
                                         self._pending_tasks.add(exec_task)
@@ -2207,38 +2368,46 @@ class LiveTradingEngine:
                         except Exception as e:
                             logger.error("DOGE Theta Harvester fault", exc_info=True)
                             if 'exec_task' in locals():
-                                slot_acquired = False
-                                local_mutated = False
                                 if not exec_task.done():
                                     exec_task.cancel()
                             if local_mutated and slot_acquired:
-                                await asyncio.shield(self._update_local_state(total_cost, -total_cost, state, executing_contract_id, -quantity))
+                                await self._safe_shield(self._update_local_state(total_cost, -total_cost, state, executing_contract_id, -quantity))
                                 if getattr(state, "last_traded_event", "") == executing_contract_id:
                                     state.last_traded_event = ""
                         finally:
                             if slot_acquired:
-                                await asyncio.shield(self._decrement_trade_cap())
+                                await self._safe_shield(self._decrement_trade_cap())
             # Removed unconditional `return` here so DOGE can fall through to Strategy 2 (Z-Score Breakout) if Theta Harvester conditions aren't met
             
         # -------------------------------------------------------------
         # STRATEGY 2: TREND-FILTERED SNIPER
         # -------------------------------------------------------------
-        if abs(z_score) < 2.5: return
+        if abs(z_score) < config.Z_SCORE_THRESHOLD: return
 
         if not state.active_contract_id: return
         
         # The Golden Window: 8 minutes to 3 minutes remaining
         if seconds_left < 180.0 or seconds_left > 480.0: return
         
-        trade_side = "YES" if z_score > 0 else "NO"
+        # Swapped logic for BTC-USD to trade mean reversion (buy NO on spikes, YES on dips)
+        if product_id == "BTC-USD":
+            trade_side = "NO" if z_score > 0 else "YES"
+            strat_label = "Mean Reversion"
+        else:
+            trade_side = "YES" if z_score > 0 else "NO"
+            strat_label = "Breakout"
         
         # Apply 4-Hour Macro Trend Shield
         macro = self.macro_trend.get(product_id, "FLAT")
         if trade_side == "YES" and macro == "DOWN":
-            logger.warning(f"[{product_id}] Z-Score Breakout (+{z_score:.2f}) BLOCKED by 4H Bearish Trend (Bull Trap Prevented).")
+            if time.time() - self.last_blocked_log_time.get(product_id, 0.0) > 60.0:
+                logger.warning(f"[{product_id}] Z-Score {strat_label} (+{z_score:.2f}) BLOCKED by 4H Bearish Trend (Bull Trap Prevented). [Silencing log for 60s]")
+                self.last_blocked_log_time[product_id] = time.time()
             return
         if trade_side == "NO" and macro == "UP":
-            logger.warning(f"[{product_id}] Z-Score Breakout ({z_score:.2f}) BLOCKED by 4H Bullish Trend (Bear Trap Prevented).")
+            if time.time() - self.last_blocked_log_time.get(product_id, 0.0) > 60.0:
+                logger.warning(f"[{product_id}] Z-Score {strat_label} ({z_score:.2f}) BLOCKED by 4H Bullish Trend (Bear Trap Prevented). [Silencing log for 60s]")
+                self.last_blocked_log_time[product_id] = time.time()
             return
         executing_contract_id = state.active_contract_id
         
@@ -2265,6 +2434,10 @@ class LiveTradingEngine:
                 return
             if executing_contract_id != state.active_contract_id:
                 return
+                
+            macro_check = self.macro_trend.get(product_id, "FLAT")
+            if trade_side == "YES" and macro_check == "DOWN": return
+            if trade_side == "NO" and macro_check == "UP": return
                 
             best_bid, best_ask, bid_depth, ask_depth = best_vals
             spread = best_ask - best_bid
@@ -2297,20 +2470,23 @@ class LiveTradingEngine:
                                 should_decrement = True
                             else:
                                 total_cost = Decimal(quantity) * limit_price
-                                self.available_balance -= total_cost
-                                self.capital_in_flight += total_cost
-                                
-                                state.position_sides[executing_contract_id] = trade_side
-                                state.positions[executing_contract_id] = actual_pos_size + quantity
-                                state.last_traded_event = executing_contract_id
-                                state.cooldown_until = current_time + 15.0
-                                self.state_sequence += 1
-                                local_mutated = True
+                                if self.available_balance >= total_cost:
+                                    self.available_balance -= total_cost
+                                    self.capital_in_flight += total_cost
+                                    
+                                    state.position_sides[executing_contract_id] = trade_side
+                                    state.positions[executing_contract_id] = actual_pos_size + quantity
+                                    state.last_traded_event = executing_contract_id
+                                    state.cooldown_until = current_time + 15.0
+                                    self.state_sequence += 1
+                                    local_mutated = True
+                                else:
+                                    should_decrement = True
             
             if should_decrement:
                 return
             
-            logger.warning(f"[{product_id}] Z-SCORE BREAKOUT ({z_score:.2f})! Ask: ${best_ask:.2f} | Sniping {quantity} contracts.")
+            logger.warning(f"[{product_id}] Z-SCORE {strat_label.upper()} ({z_score:.2f})! Ask: ${best_ask:.2f} | Sniping {quantity} contracts.")
             
             exec_task = asyncio.create_task(
                 self.execute_and_hold_entry(
@@ -2324,18 +2500,16 @@ class LiveTradingEngine:
         except Exception as e:
             logger.error("Z-Score Momentum processing fault", exc_info=True) 
             if 'exec_task' in locals():
-                slot_acquired = False
-                local_mutated = False
                 if not exec_task.done():
                     exec_task.cancel()
             if local_mutated and slot_acquired:
                 # Revert leaked local balance if task creation failed
-                await asyncio.shield(self._update_local_state(total_cost, -total_cost, state, executing_contract_id, -quantity))
+                await self._safe_shield(self._update_local_state(total_cost, -total_cost, state, executing_contract_id, -quantity))
                 if getattr(state, "last_traded_event", "") == executing_contract_id:
                     state.last_traded_event = ""
         finally:
             if slot_acquired:
-                await asyncio.shield(self._decrement_trade_cap())
+                await self._safe_shield(self._decrement_trade_cap())
 
     # ==========================================
     # BINANCE LIQUIDATION SNIPER
@@ -2456,15 +2630,18 @@ class LiveTradingEngine:
                                     should_decrement = True
                                 else:
                                     total_cost = Decimal(quantity) * limit_price
-                                    self.available_balance -= total_cost
-                                    self.capital_in_flight += total_cost
-                                    
-                                    state.position_sides[executing_contract_id] = trade_side
-                                    state.positions[executing_contract_id] = actual_pos_size + quantity
-                                    state.last_traded_event = executing_contract_id
-                                    state.cooldown_until = current_time + 15.0
-                                    self.state_sequence += 1
-                                    local_mutated = True
+                                    if self.available_balance >= total_cost:
+                                        self.available_balance -= total_cost
+                                        self.capital_in_flight += total_cost
+                                        
+                                        state.position_sides[executing_contract_id] = trade_side
+                                        state.positions[executing_contract_id] = actual_pos_size + quantity
+                                        state.last_traded_event = executing_contract_id
+                                        state.cooldown_until = current_time + 15.0
+                                        self.state_sequence += 1
+                                        local_mutated = True
+                                    else:
+                                        should_decrement = True
                 
                 if should_decrement:
                     return
@@ -2482,18 +2659,16 @@ class LiveTradingEngine:
             except Exception as inner_e:
                 logger.error("Liquidation execution fault", exc_info=True)
                 if 'exec_task' in locals():
-                    slot_acquired = False
-                    local_mutated = False
                     if not exec_task.done():
                         exec_task.cancel()
                 if local_mutated and slot_acquired:
-                    await asyncio.shield(self._update_local_state(total_cost, -total_cost, state, executing_contract_id, -quantity))
+                    await self._safe_shield(self._update_local_state(total_cost, -total_cost, state, executing_contract_id, -quantity))
                     if getattr(state, "last_traded_event", "") == executing_contract_id:
                         state.last_traded_event = ""
                 raise
             finally:
                 if slot_acquired:
-                    await asyncio.shield(self._decrement_trade_cap())
+                    await self._safe_shield(self._decrement_trade_cap())
                 
         except Exception as e:
             logger.error("Liquidation processing fault", exc_info=True) 

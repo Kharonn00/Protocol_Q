@@ -91,3 +91,9 @@ CACHEDIR.TAG
 GEMINI.md
 *.md
 *.skill
+monte_carlo_test.py
+
+# Folders
+scratch/
+.gemini/
+security-engineer/

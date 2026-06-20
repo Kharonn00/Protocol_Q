@@ -10,6 +10,7 @@
 *.p12
 *.pfx
 kalshi-key.pem
+monte_carlo_test.py
 
 # Python & Build Cache
 __pycache__/
@@ -41,3 +42,8 @@ README*
 # Gemini CLI
 GEMINI.md
 *.skill
+
+# Folders
+scratch/
+.gemini/
+security-engineer/
