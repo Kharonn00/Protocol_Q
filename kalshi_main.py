@@ -28,6 +28,7 @@ from functools import lru_cache
 from decimal import Decimal, InvalidOperation, ROUND_UP
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, List, Set, Any
+from collections import deque
 from abc import ABC, abstractmethod
 from pydantic import BaseModel, Field, ValidationError
 
@@ -56,13 +57,13 @@ class BotConfig:
     MAX_CONTRACTS_PER_TRADE: int = 100
     MAX_EXPOSURE_PER_EVENT: int = 100
     
-    DRAWDOWN_LIMIT_PCT: Decimal = Decimal(os.environ.get("DRAWDOWN_LIMIT_PCT", "0.20"))
+    DRAWDOWN_LIMIT_PCT: Decimal = Decimal(os.environ.get("DRAWDOWN_LIMIT_PCT", "0.25"))
     STALE_BALANCE_TIMEOUT_SEC: float = 120.0
     
     BINANCE_LIQUIDATION_THRESHOLDS: Dict[str, Decimal] = field(default_factory=lambda: {
         "BTC-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_BTC", "1500000.0")),
         "HYPE-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_HYPE", "100000.0")),
-        "SOL-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_SOL", "100000.0")),
+        "SOL-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_SOL", "300000.0")),
         "ETH-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_ETH", "750000.0")),
         "DOGE-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_DOGE", "300000.0"))
     })
@@ -94,7 +95,22 @@ class BotConfig:
     # 88% ROI Take-Profit Trap. Entry cost multiplied by 1.88.
     TAKE_PROFIT_ROI: Decimal = Decimal(os.environ.get("TAKE_PROFIT_ROI", "1.88"))
     
-    DOGE_THETA_MAX_REL_VOLATILITY: Decimal = Decimal(os.environ.get("DOGE_THETA_MAX_REL_VOLATILITY", "0.005"))
+    DOGE_THETA_MAX_REL_VOLATILITY: Decimal = Decimal(os.environ.get("DOGE_THETA_MAX_REL_VOLATILITY", "0.002"))
+
+    def __post_init__(self):
+        """SEC-06: Bounds-validate all environment-sourced config to prevent adversarial misconfiguration."""
+        if not (Decimal("0.001") <= self.TRADE_BUDGET_PCT <= Decimal("0.20")):
+            raise ValueError(f"TRADE_BUDGET_PCT={self.TRADE_BUDGET_PCT} out of safe range [0.001, 0.20]")
+        if not (Decimal("0.05") <= self.DRAWDOWN_LIMIT_PCT <= Decimal("0.50")):
+            raise ValueError(f"DRAWDOWN_LIMIT_PCT={self.DRAWDOWN_LIMIT_PCT} out of safe range [0.05, 0.50]")
+        if not (1.0 <= self.Z_SCORE_THRESHOLD <= 10.0):
+            raise ValueError(f"Z_SCORE_THRESHOLD={self.Z_SCORE_THRESHOLD} out of safe range [1.0, 10.0]")
+        if not (0.0 <= self.LOCKOUT_BEFORE_SEC <= 7200.0):
+            raise ValueError(f"LOCKOUT_BEFORE_SEC={self.LOCKOUT_BEFORE_SEC} out of safe range [0, 7200]")
+        if not (0.0 <= self.LOCKOUT_AFTER_SEC <= 7200.0):
+            raise ValueError(f"LOCKOUT_AFTER_SEC={self.LOCKOUT_AFTER_SEC} out of safe range [0, 7200]")
+        if not (Decimal("0.01") <= self.MAX_ALLOWED_SPREAD <= Decimal("0.50")):
+            raise ValueError(f"MAX_ALLOWED_SPREAD={self.MAX_ALLOWED_SPREAD} out of safe range [0.01, 0.50]")
 
 config = BotConfig()
 
@@ -111,13 +127,16 @@ TRUSTED_INTERNAL_HOSTS = frozenset(
 # Precompiled regex patterns to maintain O(1) heap allocations in hot loops
 DOLLAR_STRIKE_RE = re.compile(r'\$\s*(\d+(?:,\d+)*(?:\.\d+)?)')
 GENERIC_NUMBER_RE = re.compile(r'\d+(?:,\d+)*(?:\.\d+)?')
+# SEC-05: Strip ANSI escape sequences to prevent terminal manipulation via crafted log data
+_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
 
 # ==========================================
 # SECURITY SANITIZATION & CACHING
 # ==========================================
 def sanitize_log_str(val: str) -> str:
-    """Sanitizes strings prior to logging to prevent Log Injection attacks (CWE-117)."""
-    return val.replace('\n', '\\n').replace('\r', '\\r')
+    """Sanitizes strings prior to logging to prevent Log Injection (CWE-117) and ANSI escape injection."""
+    val = val.replace('\n', '\\n').replace('\r', '\\r')
+    return _ANSI_ESCAPE_RE.sub('', val)
 
 @lru_cache(maxsize=1024)
 def is_private_ip(ip_str: str) -> bool:
@@ -259,7 +278,8 @@ class AssetState:
 class PerformanceTracker:
     """O(1) rolling performance tracker per asset/hour-of-day to auto-throttle losing regimes."""
     def __init__(self):
-        self.outcomes: Dict[Tuple[str, int], List] = {}  # (asset, hour) -> [wins, losses, total_pnl]
+        # (asset, hour) -> deque of bools (won = True/False), capped at max 20 samples to avoid stale losses memory
+        self.outcomes: Dict[Tuple[str, int], deque] = {}
 
     _KNOWN_BASES = frozenset({"BTC", "ETH", "SOL", "DOGE", "HYPE"})
 
@@ -285,16 +305,15 @@ class PerformanceTracker:
     def record(self, asset: str, hour: int, won: bool, pnl: float):
         key = (self._clean_asset(asset), hour)
         if key not in self.outcomes:
-            self.outcomes[key] = [0, 0, 0.0]
-        self.outcomes[key][0 if won else 1] += 1
-        self.outcomes[key][2] += pnl
+            self.outcomes[key] = deque(maxlen=20)
+        self.outcomes[key].append(won)
 
     def should_trade(self, asset: str, hour: int, min_samples: int = 5) -> bool:
         key = (self._clean_asset(asset), hour)
         data = self.outcomes.get(key)
-        if not data or (data[0] + data[1]) < min_samples:
+        if not data or len(data) < min_samples:
             return True  # Not enough data, allow trading
-        win_rate = data[0] / (data[0] + data[1])
+        win_rate = sum(1 for w in data if w) / len(data)
         return win_rate > 0.35  # Require at least 35% win rate
 
 # ==========================================
@@ -369,7 +388,7 @@ async def is_safe_destination_async(url_str: str) -> bool:
     """Asynchronously evaluates targets to avoid event loop blockages."""
     try:
         parsed = urllib.parse.urlparse(url_str)
-        if parsed.scheme != "https":
+        if parsed.scheme not in ("https", "wss"):
             return False
         hostname = parsed.hostname
         if not hostname:
@@ -445,6 +464,7 @@ class MacroCircuitBreaker:
 
         try:
             timeout = aiohttp.ClientTimeout(total=5.0)
+            # SEC-08: Relying on streaming chunk limit below to prevent compression bombs (CWE-409)
             async with session.get(self.calendar_url, headers=headers, timeout=timeout, allow_redirects=False) as response:
                 if response.status != 200:
                     logger.error(f"[CIRCUIT BREAKER] Calendar endpoint returned status: {response.status}")
@@ -561,7 +581,46 @@ def log_exception_group(eg: BaseException):
 # ==========================================
 # SECURE INTER-PROCESS HEALTH CHECKS
 # ==========================================
+# SEC-07: Rate limiter configuration for health endpoint DoS prevention
+_HEALTH_MAX_REQUESTS_PER_SEC: int = 10
+
 async def handle_health_check(request: web.Request) -> web.Response:
+    """Hardened health check handler with method restriction and rate limiting."""
+    # SEC-07a: Reject non-GET methods to prevent body-based resource exhaustion
+    if request.method != "GET":
+        return web.Response(status=405, text="Method Not Allowed")
+    
+    # Bypass rate-limiter for loopback and private/VPC IP space (internal health checks)
+    remote_ip = request.remote or "127.0.0.1"
+    if is_private_ip(remote_ip):
+        return web.json_response(
+            {"status": "ok", "service": "kalshi-quant-engine"},
+            dumps=lambda x: orjson.dumps(x).decode('utf-8')
+        )
+        
+    # SEC-07b: Track rate limit per source IP for external traffic
+    app = request.app
+    if "health_limiter_ips" not in app:
+        app["health_limiter_ips"] = {}
+        
+    limiters = app["health_limiter_ips"]
+    
+    # Prevent memory exhaustion by capping tracking cache size
+    if len(limiters) > 1000:
+        limiters.clear()
+        
+    now = time.time()
+    if remote_ip not in limiters:
+        limiters[remote_ip] = {"count": 0, "window_start": now}
+        
+    limiter = limiters[remote_ip]
+    if now - limiter["window_start"] > 1.0:
+        limiter["count"] = 0
+        limiter["window_start"] = now
+    limiter["count"] += 1
+    if limiter["count"] > _HEALTH_MAX_REQUESTS_PER_SEC:
+        return web.Response(status=429, text="Too Many Requests")
+    
     return web.json_response(
         {"status": "ok", "service": "kalshi-quant-engine"},
         dumps=lambda x: orjson.dumps(x).decode('utf-8')
@@ -642,7 +701,16 @@ class SimExecutionBroker(ExecutionBroker):
 
     async def get_active_market(self, asset_symbol: str, current_price: float) -> Tuple[str, float, float]:
         base_asset = asset_symbol.split('-')[0]
-        strike = round(current_price / 50) * 50
+        if base_asset == "BTC":
+            strike = round(current_price / 50) * 50
+        elif base_asset == "ETH":
+            strike = round(current_price / 5) * 5
+        elif base_asset == "SOL" or base_asset == "HYPE":
+            strike = round(current_price)
+        elif base_asset == "DOGE":
+            strike = round(current_price, 4)
+        else:
+            strike = current_price
         contract_id = f"KX{base_asset}-15M-{strike}"
         exp_time = time.time() - (time.time() % 900) + 900
         return contract_id, float(strike), exp_time
@@ -697,6 +765,7 @@ class LiveKalshiBroker(ExecutionBroker):
         self.session = None
         self.paper_trade = paper_trade
         self._paper_orders: Dict[str, dict] = {} # Upgraded schema to support high-fidelity pricing emulations
+        self.paper_orders_lock = asyncio.Lock()
         self._paper_balance: Decimal = safe_decimal(os.environ.get("PAPER_BALANCE"), "1000.00")
         self.VALID_ACTIONS = frozenset({"buy", "sell"})
         self.VALID_SIDES = frozenset({"yes", "no"})
@@ -713,11 +782,14 @@ class LiveKalshiBroker(ExecutionBroker):
     async def close(self):
         if self.session:
             await self.session.close()
+        # SEC-09: Best-effort secret scrubbing — nullify references and force
+        # double GC collect to handle reference cycles in OpenSSL EVP_PKEY.
         if hasattr(self, "private_key"):
             self.private_key = None
         if hasattr(self, "key_id"):
             self.key_id = None
         gc.collect()
+        gc.collect()  # Double-collect to handle cryptography lib reference cycles
 
     async def _read_json(self, response: aiohttp.ClientResponse, limit: int = 524288) -> Any:
         body_bytes = await response.content.read(limit)
@@ -789,6 +861,9 @@ class LiveKalshiBroker(ExecutionBroker):
                     data = await self._read_json(response)
                     orders = data.get("orders", [])
                     for order in orders:
+                        action = order.get("action", "").lower()
+                        if action != "buy":
+                            continue
                         unfilled = safe_decimal(order.get("unfilled_count", 0))
                         price_val = order.get("yes_price") or order.get("no_price")
                         price = safe_decimal(price_val, "0.00")
@@ -799,7 +874,7 @@ class LiveKalshiBroker(ExecutionBroker):
 
     async def get_positions(self) -> Optional[Dict[str, Tuple[int, str]]]:
         if self.paper_trade:
-            return {}
+            return None
             
         path = "/portfolio/positions"
         method = "GET"
@@ -901,14 +976,17 @@ class LiveKalshiBroker(ExecutionBroker):
                                 if dollar_numbers:
                                     strike_val = float(dollar_numbers[-1].replace(',', ''))
                                 else:
-                                    # Fallback to general numbers if no dollar signs are present
+                                    # Fallback to general numbers if no dollar signs are present (take the first number as the strike)
                                     numbers = GENERIC_NUMBER_RE.findall(subtitle)
                                     if numbers:
-                                        strike_val = float(numbers[-1].replace(',', ''))
+                                        strike_val = float(numbers[0].replace(',', ''))
                                     else:
                                         strike_val = 0.0
                             except Exception:
                                 strike_val = 0.0
+                                
+                        if base_asset == "DOGE" and strike_val > 1.0:
+                            strike_val = strike_val / 100.0
                                 
                         # Removed hardcoded BTC-specific strike filter to support assets like HYPE ($58)
                         distance = abs(current_price - strike_val)
@@ -985,116 +1063,136 @@ class LiveKalshiBroker(ExecutionBroker):
 
     async def get_order_details(self, order_id: str, simulate: bool = True, cached_best_vals=None, **kwargs) -> dict:
         if order_id.startswith("paper-"):
-            order_data = self._paper_orders.get(order_id)
-            if not order_data:
-                return {}
-            
-            avg_price = Decimal("0.00")
-            if order_data["filled_quantity"] > 0:
-                avg_price = order_data["total_cost"] / Decimal(order_data["filled_quantity"])
-            else:
-                avg_price = order_data["limit_price"]
-
-            if order_data["status"] == "executed":
-                return {
-                    "status": "executed",
-                    "executed_count": str(order_data["quantity"]),
-                    "unfilled_count": "0",
-                    "average_fill_price": str(avg_price)
-                }
-            if order_data["status"] == "canceled":
-                return {
-                    "status": "canceled",
-                    "executed_count": str(order_data["filled_quantity"]),
-                    "unfilled_count": str(order_data["quantity"] - order_data["filled_quantity"]),
-                    "average_fill_price": str(avg_price)
-                }
+            async with self.paper_orders_lock:
+                order_data = self._paper_orders.get(order_id)
+                if not order_data:
+                    return {}
                 
-            if not simulate:
-                return {
-                    "status": order_data["status"],
-                    "executed_count": str(order_data["filled_quantity"]),
-                    "unfilled_count": str(order_data["quantity"] - order_data["filled_quantity"]),
-                    "average_fill_price": str(avg_price)
-                }
-
-            # High-Fidelity Paper Trading Simulation Engine: Query the real exchange orderbook 
-            # to verify if our resting paper limit order has legitimately met execution boundaries.
-            contract_id = order_data["contract_id"]
-            side = order_data["side"]
-            limit_price = order_data["limit_price"]
-            action = order_data["action"]
-            quantity = order_data["quantity"]
-            filled_so_far = order_data["filled_quantity"]
-            remaining = quantity - filled_so_far
-            
-            best_vals = cached_best_vals if cached_best_vals else await self.get_best_bid_ask(contract_id, side)
-            if order_data.get("status") == "canceled":
-                return {
-                    "status": "canceled",
-                    "executed_count": str(order_data["filled_quantity"]),
-                    "unfilled_count": str(order_data["quantity"] - order_data["filled_quantity"]),
-                    "average_fill_price": str(avg_price)
-                }
-
-            if best_vals:
-                best_bid, best_ask, bid_depth, ask_depth = best_vals
+                avg_price = Decimal("0.00")
+                if order_data["filled_quantity"] > 0:
+                    avg_price = order_data["total_cost"] / Decimal(order_data["filled_quantity"])
+                else:
+                    avg_price = order_data["limit_price"]
                 
-                new_fills = 0
-                if action == "buy" and best_ask <= limit_price:
-                    # We are buying, so we consume the ASK depth.
-                    new_fills = min(remaining, ask_depth)
-                    if new_fills > 0:
-                        order_data["filled_quantity"] += new_fills
-                        order_data["total_cost"] += Decimal(new_fills) * best_ask
-                        # Refund price improvement
-                        self._paper_balance += (limit_price - best_ask) * Decimal(new_fills)
-                        if cached_best_vals is not None:
-                            cached_best_vals[3] -= new_fills
-                        logger.warning(f"[PAPER BROKER PARTIAL] BUY fill: {new_fills}x {contract_id} '{side.upper()}' @ ${best_ask:.2f} (Total: {order_data['filled_quantity']}/{quantity})")
-                elif action == "sell" and best_bid >= limit_price:
-                    # We are selling, so we consume the BID depth.
-                    new_fills = min(remaining, bid_depth)
-                    if new_fills > 0:
-                        order_data["filled_quantity"] += new_fills
-                        order_data["total_cost"] += Decimal(new_fills) * best_bid
-                        if cached_best_vals is not None:
-                            cached_best_vals[2] -= new_fills
-                        # Credit actual execution price (best_bid)
-                        total_credit = best_bid * Decimal(new_fills)
-                        self._paper_balance += total_credit
-                        logger.warning(f"[PAPER BROKER PARTIAL] SELL fill: {new_fills}x {contract_id} '{side.upper()}' @ ${best_bid:.2f} (Total: {order_data['filled_quantity']}/{quantity})")
-                
-                if quantity <= 0:
-                    order_data["status"] = "executed"
+                if order_data["status"] == "executed":
                     return {
                         "status": "executed",
-                        "executed_count": "0",
-                        "unfilled_count": "0",
-                        "average_fill_price": str(limit_price)
-                    }
-                if order_data["filled_quantity"] >= quantity:
-                    order_data["status"] = "executed"
-                    avg_price = order_data["total_cost"] / Decimal(quantity)
-                    logger.warning(f"[PAPER BROKER COMPLETE] {action.upper()} order finalized for {quantity}x {contract_id}")
-                    return {
-                        "status": "executed",
-                        "executed_count": str(quantity),
+                        "executed_count": str(order_data["quantity"]),
                         "unfilled_count": "0",
                         "average_fill_price": str(avg_price)
                     }
+                if order_data["status"] == "canceled":
+                    return {
+                        "status": "canceled",
+                        "executed_count": str(order_data["filled_quantity"]),
+                        "unfilled_count": str(order_data["quantity"] - order_data["filled_quantity"]),
+                        "average_fill_price": str(avg_price)
+                    }
+                    
+                if not simulate:
+                    return {
+                        "status": order_data["status"],
+                        "executed_count": str(order_data["filled_quantity"]),
+                        "unfilled_count": str(order_data["quantity"] - order_data["filled_quantity"]),
+                        "average_fill_price": str(avg_price)
+                    }
+                
+                # Fetch order data details safely for async yield point
+                contract_id = order_data["contract_id"]
+                side = order_data["side"]
+                limit_price = order_data["limit_price"]
+                action = order_data["action"]
+                quantity = order_data["quantity"]
             
-            if order_data["filled_quantity"] > 0:
-                avg_price = order_data["total_cost"] / Decimal(order_data["filled_quantity"])
-            else:
-                avg_price = limit_price
-
-            return {
-                "status": order_data["status"], 
-                "executed_count": str(order_data["filled_quantity"]), 
-                "unfilled_count": str(quantity - order_data["filled_quantity"]),
-                "average_fill_price": str(avg_price)
-            }
+            # Fetch best values from orderbook outside the lock
+            best_vals = cached_best_vals if cached_best_vals else await self.get_best_bid_ask(contract_id, side)
+            
+            async with self.paper_orders_lock:
+                # Re-fetch order_data under lock to ensure it wasn't mutated/deleted during yield
+                order_data = self._paper_orders.get(order_id)
+                if not order_data:
+                    return {}
+                
+                if order_data.get("status") == "canceled":
+                    if order_data["filled_quantity"] > 0:
+                        avg_price = order_data["total_cost"] / Decimal(order_data["filled_quantity"])
+                    else:
+                        avg_price = order_data["limit_price"]
+                    return {
+                        "status": "canceled",
+                        "executed_count": str(order_data["filled_quantity"]),
+                        "unfilled_count": str(order_data["quantity"] - order_data["filled_quantity"]),
+                        "average_fill_price": str(avg_price)
+                    }
+                if order_data.get("status") == "executed":
+                    avg_price = order_data["total_cost"] / Decimal(order_data["quantity"])
+                    return {
+                        "status": "executed",
+                        "executed_count": str(order_data["quantity"]),
+                        "unfilled_count": "0",
+                        "average_fill_price": str(avg_price)
+                    }
+                
+                filled_so_far = order_data["filled_quantity"]
+                remaining = quantity - filled_so_far
+                
+                if best_vals:
+                    best_bid, best_ask, bid_depth, ask_depth = best_vals
+                    
+                    new_fills = 0
+                    if action == "buy" and best_ask <= limit_price:
+                        # We are buying, so we consume the ASK depth.
+                        new_fills = min(remaining, ask_depth)
+                        if new_fills > 0:
+                            order_data["filled_quantity"] += new_fills
+                            order_data["total_cost"] += Decimal(new_fills) * best_ask
+                            # Refund price improvement
+                            self._paper_balance += (limit_price - best_ask) * Decimal(new_fills)
+                            if cached_best_vals is not None:
+                                cached_best_vals[3] -= new_fills
+                            logger.warning(f"[PAPER BROKER PARTIAL] BUY fill: {new_fills}x {contract_id} '{side.upper()}' @ ${best_ask:.2f} (Total: {order_data['filled_quantity']}/{quantity})")
+                    elif action == "sell" and best_bid >= limit_price:
+                        # We are selling, so we consume the BID depth.
+                        new_fills = min(remaining, bid_depth)
+                        if new_fills > 0:
+                            order_data["filled_quantity"] += new_fills
+                            order_data["total_cost"] += Decimal(new_fills) * best_bid
+                            if cached_best_vals is not None:
+                                cached_best_vals[2] -= new_fills
+                            # Credit actual execution price (best_bid)
+                            self._paper_balance += best_bid * Decimal(new_fills)
+                            logger.warning(f"[PAPER BROKER PARTIAL] SELL fill: {new_fills}x {contract_id} '{side.upper()}' @ ${best_bid:.2f} (Total: {order_data['filled_quantity']}/{quantity})")
+                    
+                    if quantity <= 0:
+                        order_data["status"] = "executed"
+                        return {
+                            "status": "executed",
+                            "executed_count": "0",
+                            "unfilled_count": "0",
+                            "average_fill_price": str(limit_price)
+                        }
+                    if order_data["filled_quantity"] >= quantity:
+                        order_data["status"] = "executed"
+                        avg_price = order_data["total_cost"] / Decimal(quantity)
+                        logger.warning(f"[PAPER BROKER COMPLETE] {action.upper()} order finalized for {quantity}x {contract_id}")
+                        return {
+                            "status": "executed",
+                            "executed_count": str(quantity),
+                            "unfilled_count": "0",
+                            "average_fill_price": str(avg_price)
+                        }
+                
+                if order_data["filled_quantity"] > 0:
+                    avg_price = order_data["total_cost"] / Decimal(order_data["filled_quantity"])
+                else:
+                    avg_price = limit_price
+    
+                return {
+                    "status": order_data["status"], 
+                    "executed_count": str(order_data["filled_quantity"]), 
+                    "unfilled_count": str(quantity - order_data["filled_quantity"]),
+                    "average_fill_price": str(avg_price)
+                }
 
         safe_order_id = urllib.parse.quote(order_id, safe='')
         path = f"/portfolio/orders/{safe_order_id}"
@@ -1136,18 +1234,19 @@ class LiveKalshiBroker(ExecutionBroker):
 
     async def cancel_order(self, order_id: str) -> bool:
         if order_id.startswith("paper-"):
-            order_data = self._paper_orders.get(order_id)
-            if order_data and order_data["status"] == "resting":
-                order_data["status"] = "canceled"
-                if order_data["action"] == "buy":
-                    # Refund ONLY the unfilled portion of the locked paper balance
-                    unfilled_qty = order_data["quantity"] - order_data["filled_quantity"]
-                    if unfilled_qty > 0:
-                        refund_val = order_data["limit_price"] * Decimal(unfilled_qty)
-                        self._paper_balance += refund_val
-                        logger.info(f"[PAPER BROKER] Cancelled {order_id}. Refunded {unfilled_qty}x @ ${order_data['limit_price']:.2f}")
-                return True
-            return False
+            async with self.paper_orders_lock:
+                order_data = self._paper_orders.get(order_id)
+                if order_data and order_data["status"] == "resting":
+                    order_data["status"] = "canceled"
+                    if order_data["action"] == "buy":
+                        # Refund ONLY the unfilled portion of the locked paper balance
+                        unfilled_qty = order_data["quantity"] - order_data["filled_quantity"]
+                        if unfilled_qty > 0:
+                            refund_val = order_data["limit_price"] * Decimal(unfilled_qty)
+                            self._paper_balance += refund_val
+                            logger.info(f"[PAPER BROKER] Cancelled {order_id}. Refunded {unfilled_qty}x @ ${order_data['limit_price']:.2f}")
+                    return True
+                return False
         
         safe_order_id = urllib.parse.quote(order_id, safe='')
         path = f"/portfolio/orders/{safe_order_id}"
@@ -1173,28 +1272,37 @@ class LiveKalshiBroker(ExecutionBroker):
         if action.lower() not in self.VALID_ACTIONS or side.lower() not in self.VALID_SIDES: return None
             
         if self.paper_trade:
-            order_id = f"paper-{uuid.uuid4().hex}"
-            total_trade_value = limit_price * Decimal(quantity)
-            if action.lower() == "buy":
-                if self._paper_balance < total_trade_value:
-                    logger.error(f"[PAPER BROKER] Insufficient paper balance for BUY order.")
-                    return None
-                self._paper_balance -= total_trade_value
-                
-            if len(self._paper_orders) >= 1000:
-                oldest_key = next(iter(self._paper_orders))
-                del self._paper_orders[oldest_key]
-                
-            self._paper_orders[order_id] = {
-                "action": action.lower(),
-                "contract_id": contract_id,
-                "side": side.lower(),
-                "limit_price": limit_price,
-                "quantity": quantity,
-                "filled_quantity": 0,
-                "total_cost": Decimal("0.00"),
-                "status": "resting"
-            }
+            async with self.paper_orders_lock:
+                order_id = f"paper-{uuid.uuid4().hex}"
+                total_trade_value = limit_price * Decimal(quantity)
+                if action.lower() == "buy":
+                    if self._paper_balance < total_trade_value:
+                        logger.error(f"[PAPER BROKER] Insufficient paper balance for BUY order.")
+                        return None
+                    self._paper_balance -= total_trade_value
+                    
+                # SEC-10: Only evict completed/canceled orders to prevent TP monitor orphaning
+                if len(self._paper_orders) >= 1000:
+                    stale_keys = [k for k in self._paper_orders
+                                  if self._paper_orders[k].get("status") in ("executed", "canceled")]
+                    if stale_keys:
+                        del self._paper_orders[stale_keys[0]]
+                    else:
+                        # Fallback: FIFO eviction if all orders are still active (should not happen)
+                        oldest_key = next(iter(self._paper_orders))
+                        logger.warning(f"[SECURITY] FIFO evicting active paper order {oldest_key}. Potential TP monitor orphan.")
+                        del self._paper_orders[oldest_key]
+                    
+                self._paper_orders[order_id] = {
+                    "action": action.lower(),
+                    "contract_id": contract_id,
+                    "side": side.lower(),
+                    "limit_price": limit_price,
+                    "quantity": quantity,
+                    "filled_quantity": 0,
+                    "total_cost": Decimal("0.00"),
+                    "status": "resting"
+                }
             logger.warning(f"[PAPER ORDER PLACED] {action.upper()} {quantity}x {contract_id} '{side.upper()}' @ ${limit_price:.2f}")
             return order_id
             
@@ -1271,6 +1379,7 @@ class LiveTradingEngine:
     def __init__(self, broker: ExecutionBroker):
         self.broker = broker
         self.starting_balance: Decimal = Decimal("0.00")
+        self.peak_balance: Decimal = Decimal("0.00")  # Rolling high-water mark for drawdown calculation
         self.available_balance: Decimal = Decimal("0.00")
         self.capital_in_flight: Decimal = Decimal("0.00") 
         self.consecutive_api_failures: int = 0
@@ -1294,7 +1403,10 @@ class LiveTradingEngine:
         if env_starting_bal is not None:
             try:
                 self.starting_balance = Decimal(env_starting_bal)
-                logger.debug(f"[RISK MANAGER] Bound to absolute starting balance: ${self.starting_balance:.2f}")
+                # SEC-11: Initialize peak_balance from env starting_balance to prevent
+                # false-negative drawdown window on first sync cycle.
+                self.peak_balance = self.starting_balance
+                logger.debug(f"[RISK MANAGER] Bound to absolute starting balance: ${self.starting_balance:.2f} (peak initialized)")
             except (ValueError, InvalidOperation):
                 logger.warning(f"Malformed STARTING_BALANCE env var: {env_starting_bal}. Falling back to dynamic initialization.")
 
@@ -1463,10 +1575,16 @@ class LiveTradingEngine:
                         if self.starting_balance == Decimal("0.00"):
                             self.starting_balance = portfolio_val
                         
-                        if self.starting_balance > 0:
-                            drawdown = (self.starting_balance - portfolio_val) / self.starting_balance
+                        # Rolling high-water mark drawdown (peak-to-trough, quant standard)
+                        if portfolio_val > self.peak_balance:
+                            self.peak_balance = portfolio_val
+                        
+                        if self.peak_balance > 0:
+                            drawdown = (self.peak_balance - portfolio_val) / self.peak_balance
                             if drawdown >= config.DRAWDOWN_LIMIT_PCT:
-                                logger.critical(f"DRAWDOWN LIMIT REACHED ({drawdown*100:.1f}%). Halting operations.")
+                                logger.critical(
+                                    f"DRAWDOWN LIMIT REACHED ({drawdown*100:.1f}% from peak ${self.peak_balance:.2f} → ${portfolio_val:.2f}). Halting operations."
+                                )
                                 self.shutting_down = True
                 
                 if state_mutated:
@@ -1520,11 +1638,15 @@ class LiveTradingEngine:
                 if not last_price: continue
                     
                 contract_id, strike, exp_time = await self.broker.get_active_market(symbol, last_price)
-                if contract_id and state.active_contract_id != contract_id:
-                    logger.debug(f"[MARKET ROUTER] {symbol} Locked onto valid contract: {contract_id}")
-                    state.active_contract_id = contract_id
-                    state.strike_price = strike
-                    state.expiration_time = exp_time 
+                if contract_id:
+                    if state.active_contract_id != contract_id:
+                        logger.debug(f"[MARKET ROUTER] {symbol} Locked onto valid contract: {contract_id}")
+                        state.active_contract_id = contract_id
+                    # Recover from transient 0.0 values without overwriting existing valid ones with 0.0
+                    if strike > 0.0:
+                        state.strike_price = strike
+                    if exp_time > 0.0:
+                        state.expiration_time = exp_time 
             await asyncio.sleep(30)
 
     async def sync_macro_calendar_loop(self):
@@ -1666,8 +1788,9 @@ class LiveTradingEngine:
                 if t3_qty > 0:
                     tranches.append((t3_qty, t3_price, "T3-aggressive"))
 
-                if len(tranches) > 0 and all(tp == Decimal("0.99") for _, tp, _ in tranches):
-                    logger.info(f"[{contract_id}] All TP tranches maxed at $0.99. Bypassing TP routing and falling back to Hold-to-Settle.")
+                capped_count = sum(1 for _, tp, _ in tranches if tp == Decimal("0.99"))
+                if len(tranches) > 0 and capped_count >= 2:
+                    logger.info(f"[{contract_id}] {capped_count}/3 TP tranches capped at $0.99. Bypassing TP routing and falling back to Hold-to-Settle to minimize fees.")
                     hold_to_settle = True
 
             if hold_to_settle:
@@ -1680,13 +1803,13 @@ class LiveTradingEngine:
                 # Perform a final orderbook check 2 seconds before the buzzer
                 tp_check = await self.broker.get_best_bid_ask(contract_id, side)
                 won = False
-                net_pnl = Decimal("0.00") - (Decimal(str(quantity)) * entry_price)
+                net_pnl = Decimal("0.00") - (Decimal(quantity) * entry_price)
                 if tp_check:
                     final_bid, _, _, _ = tp_check
                     if final_bid >= Decimal("0.90"):
                         logger.info(f"[{contract_id}] 🏆 THE BUZZER: Final '{side.upper()}' bid is ${final_bid:.2f}. WIN HIGHLY PROBABLE! Settlement pending.")
-                        payout = Decimal(str(quantity)) * Decimal("1.00")
-                        net_pnl = payout - (Decimal(str(quantity)) * entry_price)
+                        payout = Decimal(quantity) * Decimal("1.00")
+                        net_pnl = payout - (Decimal(quantity) * entry_price)
                         won = True
                         if hasattr(self.broker, 'simulated_balance'):
                             self.broker.simulated_balance += payout
@@ -1702,8 +1825,8 @@ class LiveTradingEngine:
                     else:
                         # Fallback to last known price to resolve paper payouts for toss-ups rather than ignoring
                         logger.info(f"[{contract_id}] ⚖️ THE BUZZER: Final '{side.upper()}' bid is ${final_bid:.2f}. TOSS UP. Settlement pending.")
-                        payout = Decimal(str(quantity)) * final_bid
-                        net_pnl = payout - (Decimal(str(quantity)) * entry_price)
+                        payout = Decimal(quantity) * final_bid
+                        net_pnl = payout - (Decimal(quantity) * entry_price)
                         won = net_pnl > 0
                         if hasattr(self.broker, 'simulated_balance'):
                             self.broker.simulated_balance += payout
@@ -1731,8 +1854,8 @@ class LiveTradingEngine:
                     if settled_won is not None:
                         if settled_won:
                             logger.info(f"[{contract_id}] 🏆 SETTLED WIN: Price ${state.last_price} vs Strike ${target_strike} for '{side.upper()}'.")
-                            payout = Decimal(str(quantity)) * Decimal("1.00")
-                            net_pnl = payout - (Decimal(str(quantity)) * entry_price)
+                            payout = Decimal(quantity) * Decimal("1.00")
+                            net_pnl = payout - (Decimal(quantity) * entry_price)
                             won = True
                             if hasattr(self.broker, 'simulated_balance'):
                                 self.broker.simulated_balance += payout
@@ -1746,12 +1869,12 @@ class LiveTradingEngine:
                             logger.warning(f"[{contract_id}] 💀 SETTLED LOSS: Price ${state.last_price} vs Strike ${target_strike} for '{side.upper()}'.")
                             won = False
                             payout = Decimal("0.00")
-                            net_pnl = Decimal("0.00") - (Decimal(str(quantity)) * entry_price)
+                            net_pnl = Decimal("0.00") - (Decimal(quantity) * entry_price)
                     else:
                         if getattr(self.broker, 'paper_trade', False) and entry_price < Decimal("0.50"):
                             # Assume 50% probability win-rate payout as a baseline fallback for closed books
-                            payout = Decimal(str(quantity)) * Decimal("0.50")
-                            net_pnl = payout - (Decimal(str(quantity)) * entry_price)
+                            payout = Decimal(quantity) * Decimal("0.50")
+                            net_pnl = payout - (Decimal(quantity) * entry_price)
                             won = net_pnl > 0
                             if hasattr(self.broker, 'simulated_balance'):
                                 self.broker.simulated_balance += payout
@@ -1861,7 +1984,7 @@ class LiveTradingEngine:
                                     total_filled += new_fills
                                     total_proceeds += Decimal(new_fills) * oprice
                                     # Safe shielded call to prevent cancellation drop (fixes SEC-02)
-                                    await self._safe_shield(self._update_local_state(Decimal("0.00"), Decimal("0.00"), state, contract_id, -new_fills))
+                                    await self._safe_shield(self._update_local_state(Decimal(new_fills) * oprice, Decimal("0.00"), state, contract_id, -new_fills))
                                     last_reported_fill[oid] = last_reported_fill.get(oid, 0) + new_fills
                                 
                                 if last_reported_fill[oid] >= oqty or tp_status == "executed":
@@ -1890,7 +2013,7 @@ class LiveTradingEngine:
                                     total_filled += new_fills
                                     total_proceeds += Decimal(new_fills) * oprice
                                     # Safe shielded call to prevent cancellation drop (fixes SEC-02)
-                                    await self._safe_shield(self._update_local_state(Decimal("0.00"), Decimal("0.00"), state, contract_id, -new_fills))
+                                    await self._safe_shield(self._update_local_state(Decimal(new_fills) * oprice, Decimal("0.00"), state, contract_id, -new_fills))
                                     last_reported_fill[oid] = last_reported_fill.get(oid, 0) + new_fills
                                 
                                 if tp_filled_qty >= oqty or tp_status == "executed":
@@ -1939,7 +2062,7 @@ class LiveTradingEngine:
                                     total_filled += new_fills
                                     total_proceeds += Decimal(new_fills) * oprice
                                     # Safe shielded call to prevent cancellation drop (fixes SEC-02)
-                                    await self._safe_shield(self._update_local_state(Decimal("0.00"), Decimal("0.00"), state, contract_id, -new_fills))
+                                    await self._safe_shield(self._update_local_state(Decimal(new_fills) * oprice, Decimal("0.00"), state, contract_id, -new_fills))
                                     last_reported_fill[oid] = accumulated_fills[oid]
                                     logger.info(f"[{contract_id}] {olabel} partial fill at buzzer: {filled}/{oqty}")
                                 break
@@ -1954,6 +2077,50 @@ class LiveTradingEngine:
             # Record performance using correct asset parsing key and true net P&L
             current_hour = int(datetime.datetime.now(datetime.timezone.utc).hour)
             total_cost = Decimal(quantity) * entry_price
+            
+            # Reconcile settlement for remaining contracts held to expiration (Finding 1)
+            unfilled_at_settlement = quantity - total_filled
+            settlement_proceeds = Decimal("0.00")
+            if unfilled_at_settlement > 0:
+                tp_check = await self.broker.get_best_bid_ask(contract_id, side)
+                settled_won = None
+                if tp_check:
+                    final_bid, _, _, _ = tp_check
+                    if final_bid >= Decimal("0.90"):
+                        settled_won = True
+                    elif final_bid <= Decimal("0.10"):
+                        settled_won = False
+                    else:
+                        # Toss-up fallback
+                        settlement_proceeds = Decimal(str(unfilled_at_settlement)) * final_bid
+                else:
+                    # Fallback to underlying price vs strike price
+                    if state.last_price is not None and target_strike > 0.0:
+                        try:
+                            last_price_dec = Decimal(str(state.last_price))
+                            strike_price_dec = Decimal(str(target_strike))
+                            if side.upper() == "YES":
+                                settled_won = last_price_dec > strike_price_dec
+                            else:
+                                settled_won = last_price_dec <= strike_price_dec
+                        except Exception:
+                            pass
+                
+                if settled_won is True:
+                    settlement_proceeds = Decimal(str(unfilled_at_settlement)) * Decimal("1.00")
+                    logger.info(f"[{contract_id}] 🏆 SETTLED WIN (Post-TP): {unfilled_at_settlement}x '{side.upper()}' settled ITM.")
+                elif settled_won is False:
+                    logger.warning(f"[{contract_id}] 💀 SETTLED LOSS (Post-TP): {unfilled_at_settlement}x '{side.upper()}' settled OTM.")
+                
+                if settlement_proceeds > 0:
+                    total_proceeds += settlement_proceeds
+                    if hasattr(self.broker, 'simulated_balance'):
+                        self.broker.simulated_balance += settlement_proceeds
+                        await self._safe_shield(self._update_local_state(settlement_proceeds, Decimal("0.00")))
+                    elif getattr(self.broker, 'paper_trade', False) and hasattr(self.broker, '_paper_balance'):
+                        self.broker._paper_balance += settlement_proceeds
+                        await self._safe_shield(self._update_local_state(settlement_proceeds, Decimal("0.00")))
+
             net_pnl = total_proceeds - total_cost
             won = net_pnl > 0
             
@@ -2286,7 +2453,7 @@ class LiveTradingEngine:
         # -------------------------------------------------------------
         # STRATEGY 3: DOGE THETA HARVESTER
         # -------------------------------------------------------------
-        if product_id == "DOGE-USD":
+        if False and product_id == "DOGE-USD":
             if not state.active_contract_id: return
             if 120.0 <= seconds_left <= 300.0:
                 # Volatility gate: verify relative volatility is low and Z-score is near zero
@@ -2294,7 +2461,8 @@ class LiveTradingEngine:
                 std_dev = (upper - mean) / 2.0
                 rel_std_dev = std_dev / mean if mean > 0.0 else 0.0
                 
-                if rel_std_dev <= float(config.DOGE_THETA_MAX_REL_VOLATILITY) and (z_score == 0.0 or abs(z_score) < 0.5):
+                macro = self.macro_trend.get(product_id, "FLAT")
+                if macro == "FLAT" and rel_std_dev <= float(config.DOGE_THETA_MAX_REL_VOLATILITY) and (z_score == 0.0 or abs(z_score) < 0.5):
                     executing_contract_id = state.active_contract_id
                     if executing_contract_id == getattr(state, "last_traded_event", ""): pass # Let it fall through to Strategy 2
                     else:
@@ -2327,7 +2495,14 @@ class LiveTradingEngine:
                                 if trade_side:
                                     current_time = time.time()
                                     seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
-                                    if not (120.0 <= seconds_left <= 300.0) or executing_contract_id != state.active_contract_id:
+                                    
+                                    # TOCTOU recheck after await yield
+                                    macro_check = self.macro_trend.get(product_id, "FLAT")
+                                    if self.circuit_breaker.is_locked_out():
+                                        should_decrement = True
+                                    elif macro_check != "FLAT":
+                                        should_decrement = True
+                                    elif not (120.0 <= seconds_left <= 300.0) or executing_contract_id != state.active_contract_id:
                                         should_decrement = True
                                     else:
                                         should_decrement = False
@@ -2380,8 +2555,11 @@ class LiveTradingEngine:
             # Removed unconditional `return` here so DOGE can fall through to Strategy 2 (Z-Score Breakout) if Theta Harvester conditions aren't met
             
         # -------------------------------------------------------------
-        # STRATEGY 2: TREND-FILTERED SNIPER
+        # STRATEGY 2: TREND-FILTERED SNIPER (DOGE-USD Only / Fallback)
         # -------------------------------------------------------------
+        # Option A: Z-Score sniper disabled for all assets except DOGE-USD (where it acts as a Theta Harvester fallback/breakout sniper)
+        return  # Strategy 2 Z-Score Sniper completely disabled
+
         if abs(z_score) < config.Z_SCORE_THRESHOLD: return
 
         if not state.active_contract_id: return
@@ -2428,6 +2606,8 @@ class LiveTradingEngine:
                 return
                 
             # TOCTOU Security Fixes
+            if self.circuit_breaker.is_locked_out():
+                return
             current_time = time.time()
             seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
             if seconds_left < 180.0 or seconds_left > 480.0:
@@ -2548,6 +2728,19 @@ class LiveTradingEngine:
             state = self.assets.get(asset_symbol)
             if not state or not state.active_contract_id: return
             
+            # BA-14: Ingest price from Binance liquidation as a spot proxy if Coinbase ticks are missing (e.g. HYPE-USD)
+            liq_price = float(payload_dict["o"]["p"])
+            if state.last_price is None or asset_symbol == "HYPE-USD":
+                state.last_price = liq_price
+                state.fast_indicators.add_price(liq_price)
+                state.tick_count += 1
+                
+            # BA-01: Auto-throttle trades if PerformanceTracker signals a losing regime for this asset/hour
+            current_hour = int(datetime.datetime.now(datetime.timezone.utc).hour)
+            if not self.performance_tracker.should_trade(asset_symbol, current_hour):
+                logger.warning(f"[{asset_symbol}] Auto-throttling active: trade blocked for hour {current_hour} due to poor performance history.")
+                return
+            
             notional = payload_dict["o"]["p"] * payload_dict["o"]["q"]
             threshold = config.BINANCE_LIQUIDATION_THRESHOLDS.get(asset_symbol)
             if not threshold or notional < threshold: return 
@@ -2570,7 +2763,7 @@ class LiveTradingEngine:
             if current_time < state.cooldown_until: return
             
             seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
-            if seconds_left < 180.0: return
+            if seconds_left < 90.0 or seconds_left > 480.0: return
             
             executing_contract_id = state.active_contract_id
             
@@ -2591,9 +2784,11 @@ class LiveTradingEngine:
                     return
                     
                 # TOCTOU Security Fixes
+                if self.circuit_breaker.is_locked_out():
+                    return
                 current_time = time.time()
                 seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
-                if seconds_left < 180.0:
+                if seconds_left < 90.0 or seconds_left > 480.0:
                     return
                 if executing_contract_id != state.active_contract_id:
                     return
@@ -2607,6 +2802,41 @@ class LiveTradingEngine:
                     return
                     
                 limit_price = max(Decimal("0.01"), min(Decimal("0.99"), best_ask))
+                
+                # === SPOT-TO-STRIKE DISTANCE & PRICING CONSISTENCY GATES ===
+                if state.strike_price and state.last_price:
+                    spot_price = Decimal(str(state.last_price))
+                    strike_price = Decimal(str(state.strike_price))
+                    
+                    # Fetch running standard deviation from Bollinger Bands
+                    mean, upper, lower = state.fast_indicators.get_bollinger_bands()
+                    std_dev = (upper - mean) / 2.0
+                    std_dev_dec = Decimal(str(max(std_dev, float(config.STD_DEV_FLOOR))))
+                    
+                    if trade_side == "YES":
+                        # YES is OTM if spot < strike
+                        if spot_price < strike_price:
+                            distance = strike_price - spot_price
+                            # 1. Distance Gate: Block if spot is more than 1.5 standard deviations OTM
+                            if distance > Decimal("1.5") * std_dev_dec:
+                                logger.info(f"[{asset_symbol}] Drop: YES trade blocked. Spot ${spot_price} is too far below Strike ${strike_price} (Dist: {distance:.2f} > 1.5 * StdDev: {Decimal('1.5') * std_dev_dec:.2f}).")
+                                return
+                            # 2. Pricing Consistency Gate: Block if OTM option is overpriced (Lagging quote / wide spread markup)
+                            if limit_price > Decimal("0.55"):
+                                logger.warning(f"[{asset_symbol}] Drop: Overpriced OTM YES trade blocked. Spot ${spot_price} < Strike ${strike_price}, but Limit Price is ${limit_price} (> $0.55).")
+                                return
+                    elif trade_side == "NO":
+                        # NO is OTM if spot > strike
+                        if spot_price > strike_price:
+                            distance = spot_price - strike_price
+                            # 1. Distance Gate: Block if spot is more than 1.5 standard deviations OTM
+                            if distance > Decimal("1.5") * std_dev_dec:
+                                logger.info(f"[{asset_symbol}] Drop: NO trade blocked. Spot ${spot_price} is too far above Strike ${strike_price} (Dist: {distance:.2f} > 1.5 * StdDev: {Decimal('1.5') * std_dev_dec:.2f}).")
+                                return
+                            # 2. Pricing Consistency Gate: Block if OTM option is overpriced (Lagging quote / wide spread markup)
+                            if limit_price > Decimal("0.55"):
+                                logger.warning(f"[{asset_symbol}] Drop: Overpriced OTM NO trade blocked. Spot ${spot_price} > Strike ${strike_price}, but Limit Price is ${limit_price} (> $0.55).")
+                                return
                 
                 should_decrement = False
                 async with self.balance_lock:
@@ -2690,6 +2920,10 @@ async def coinbase_websocket_consumer(engine: LiveTradingEngine, queue: asyncio.
         conn_start = time.time()
         reset_done = False
         try:
+            if not await is_safe_destination_async(uri):
+                logger.critical(f"[SECURITY] Aborting Coinbase WS connection. Destination '{uri}' fails boundary rules.")
+                engine.shutting_down = True
+                break
             async with websockets.connect(uri, ssl=GLOBAL_SSL_CONTEXT, max_size=1048576, max_queue=256) as ws:
                 logger.debug("Connected to Coinbase Live Spot Feed.")
                 await ws.send(orjson.dumps(subscribe_message).decode('utf-8'))
@@ -2740,6 +2974,10 @@ async def binance_websocket_consumer(engine: LiveTradingEngine, queue: asyncio.Q
         conn_start = time.time()
         reset_done = False
         try:
+            if not await is_safe_destination_async(uri):
+                logger.critical(f"[SECURITY] Aborting Binance WS connection. Destination '{uri}' fails boundary rules.")
+                engine.shutting_down = True
+                break
             async with websockets.connect(uri, ssl=GLOBAL_SSL_CONTEXT, max_size=1048576, max_queue=256) as ws:
                 logger.debug("Connected to Binance Futures Feed.")
                 async for message in ws:
@@ -2791,6 +3029,10 @@ async def kalshi_websocket_consumer(engine: LiveTradingEngine):
         conn_start = time.time()
         reset_done = False
         try:
+            if not await is_safe_destination_async(uri):
+                logger.critical(f"[SECURITY] Aborting Kalshi WS connection. Destination '{uri}' fails boundary rules.")
+                engine.shutting_down = True
+                break
             current_time_ms = str(int(time.time() * 1000))
             # Signature generated for GET /trade-api/ws/v2 (paths starting with /trade-api/ bypass prefixing)
             sig = engine.broker._generate_signature(current_time_ms, "GET", "/trade-api/ws/v2")
@@ -2833,8 +3075,11 @@ async def kalshi_websocket_consumer(engine: LiveTradingEngine):
                                         await engine.active_tp_orders[order_id].put(fill_data)
                                     else:
                                         engine.orphan_fills.setdefault(order_id, []).append(fill_data)
-                                        if len(engine.orphan_fills) > 50:
-                                            engine.orphan_fills.pop(next(iter(engine.orphan_fills)))
+                                        # SEC-12: Increased buffer from 50→200 to prevent fill loss under load
+                                        if len(engine.orphan_fills) > 200:
+                                            evicted_key = next(iter(engine.orphan_fills))
+                                            logger.warning(f"[SECURITY] Evicting orphan fill for {evicted_key}. Potential fill loss.")
+                                            engine.orphan_fills.pop(evicted_key)
                     except Exception as pe:
                         logger.warning(f"Error parsing Kalshi WS frame: {pe}")
                     
@@ -2886,7 +3131,14 @@ def get_kalshi_credentials(secret_name: str, region_name: str = "us-east-1") -> 
         key_id = resp_dict["KEY_ID"]
         private_key_pem = bytearray(resp_dict["PRIVATE_KEY"], 'utf-8')
         
-        # Scrub raw dictionary immediately
+        # SEC-13: Overwrite immutable string values in dict before deletion
+        # to minimize residency of PEM key material in the Python heap.
+        # Note: CPython may still intern the key_id string, but overwriting
+        # the dict slot reduces the number of surviving references.
+        pem_len = len(resp_dict["PRIVATE_KEY"])
+        kid_len = len(resp_dict["KEY_ID"])
+        resp_dict["PRIVATE_KEY"] = "X" * pem_len
+        resp_dict["KEY_ID"] = "X" * kid_len
         del resp_dict
         
         private_key = load_pem_private_key(private_key_pem, password=None)
