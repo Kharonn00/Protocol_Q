@@ -3,7 +3,7 @@
 ## Executive Summary
 The Kalshi Quantitative Trading Engine is a high-frequency, fully asynchronous algorithmic trading daemon designed to execute asymmetric taker strategies on Kalshi's 15-minute Cryptocurrency Options markets. Built on absolute Zero-Trust security principles and strict $O(1)$ memory bounds, the engine aggregates Binance futures liquidation streams and Coinbase spot transaction feeds to perfectly time and snipe explosive macro-level breakouts in the Kalshi options chain.
 
-Currently deployed as an optimized, multi-stage AWS ECS Fargate service, the daemon operates two distinct quantitative sniper models: a predictive **Binance Liquidation Sniper** and a rolling **Z-Score Momentum Breakout Sniper**, completely ignoring regular algorithmic chop to capture massive, high-probability directional wicks.
+Currently deployed as an optimized, multi-stage AWS ECS Fargate service, the daemon operates the **Binance Liquidation Sniper** (Strategy 1) as its primary execution vehicle. Strategy 2 (Z-Score Sniper) and Strategy 3 (DOGE Theta Harvester) are **currently commented out / deactivated** to focus capital allocation strictly on high-leverage directional breakouts.
 
 ---
 
@@ -15,84 +15,67 @@ Currently deployed as an optimized, multi-stage AWS ECS Fargate service, the dae
 * **State Management:** Fully stateless, ephemeral execution engine (Twelve-Factor App Compliant).
 * **Secret Management:** AWS Secrets Manager via `boto3` (No local key storage).
 * **Data Ingestion:** Multiplexed secure WebSockets (Coinbase Spot Tape `ticker`, Binance Futures `!forceOrder@arr`).
+* **Health Check & DoS Rate Limiting:** Exposed on TCP Port `8080` with a per-source-IP rate limiter (bypassed for internal loopback and private VPC IP addresses to prevent orchestrator termination loops).
 
 ---
 
 ## 📈 Quantitative Strategies
 
-### 1. The Binance Liquidation Sniper (Macro Breakouts)
+### 1. The Binance Liquidation Sniper (Macro Breakouts) - [ACTIVE]
 Waits exclusively for massive directional futures liquidations to capture explosive options chain momentum.
-* Monitors the Binance USD-M Futures WebSocket for forced liquidations exceeding asset-specific thresholds (e.g., $\$1.5\text{M}$ for BTC, $\$750\text{k}$ for ETH, $\$300\text{k}$ for DOGE, and $\$100\text{k}$ for HYPE and SOL).
-* Validates liquidation events using strict notional bounds ($\$10$ to $\$1\text{B}$) to prevent logic-level overflow vulnerabilities.
-* When a high-impact macro-liquidation occurs, the bot immediately snipes predictive momentum contracts on the Kalshi chain in the direction of the cascade.
+* **Asset Support**: Tracks **BTC-USD** ($1.5M threshold), **ETH-USD** ($750k threshold), **SOL-USD** ($300k threshold), **DOGE-USD** ($300k threshold), and **HYPE-USD** ($100k threshold).
+* **Time-Window Gate**: Restricted execution to a strict window of **1.5 to 8 minutes remaining** (`90.0 <= seconds_left <= 480.0`) to avoid early-event chop and late-event illiquidity.
+* **Spot-to-Strike Distance Gate**: Restricts entries to Out-of-the-Money (OTM) options only if the spot-to-strike distance is within $1.5 \times \text{Standard Deviation}$ ($\sigma$) derived from Bollinger Bands, dynamically scaling the gate with active market volatility.
+* **Pricing Consistency Gate**: Restricts OTM entries to a maximum purchase price of `$0.55` to prevent buying stale or illiquid markup contracts.
+* **Fallback Ingestion**: If Coinbase ticks are missing (e.g. for `HYPE-USD`), the engine utilizes the Binance liquidation event price as a spot proxy to feed standard technical indicators and safety gates.
+* **Asset Performance Auto-Throttle**: Queries [PerformanceTracker](file:///C:/Users/A2/OneDrive/Documents/Python Bots/kalshi_bot/kalshi_main.py#L278) to throttle trades dynamically if the rolling outcome history (last 20 trades per asset/hour in a `deque`) yields a win rate $\le 35\%$ over at least 5 samples.
 
-### 2. Z-Score Momentum Breakout / Mean Reversion Sniper (Spot Volatility)
-Uses high-precision rolling Z-Scores computed in real-time by the Rust compiled extension indicators to exploit spot exchange momentum.
-* Snipes contracts during the **Golden Window** (8 to 3 minutes remaining in the 15-minute event) when the spot price Z-Score diverges past $\pm 3.0$.
-* **BTC-USD Mean Reversion Mode**: Trades mean reversion on BTC specifically (buys `NO` if overbought, `YES` if oversold) to prevent traps.
-* **Other Assets Breakout Mode**: Trades standard momentum breakouts on ETH, SOL, DOGE, and HYPE (buys `YES` if overbought, `NO` if oversold).
-* **4H Macro Trend Shield**: Integrates a rolling 4-hour trend filter to block any trade signal contradicting macro-directional trends.
+### 2. Z-Score Momentum Breakout / Mean Reversion Sniper - [DEACTIVATED]
+* *Status*: Commented out / disabled to prioritize liquidation breakout edge.
 
-### 3. DOGE Theta Harvester (Premium Decay Capturing)
-Designed to systematically capture theta decay on range-bound DOGE contracts.
-* Runs exclusively between minutes 10 and 13 of the Kalshi 15-minute event.
-* **Volatility Gate**: Enforces a strict Bollinger Band relative standard deviation threshold ($\le 0.005$) and Z-score range ($|Z| < 0.5$) to ensure flat market behavior.
-* **Buzzer Beater Option**: Snipes high-probability contracts between $0.80 and $0.90$ to hold to expiration, bypassing Take-Profit laddering to avoid Maker/Taker fees.
-* **Vol-Fall-through**: If the relative volatility gate is breached, the bot falls back to standard Strategy 2 momentum breakout execution instead of skipping the event.
+### 3. DOGE Theta Harvester - [DEACTIVATED]
+* *Status*: Commented out / disabled due to asymmetric risk-expectancy profiles.
 
-### 4. Macroeconomic Circuit Breaker (The Steamroller Defense)
+### 4. Macroeconomic Circuit Breaker (The Steamroller Defense) - [ACTIVE]
 Fundamentally prevents the bot from trading during exogenous regime shifts.
 * Fetches global economic schedules (e.g., CPI, FOMC, Fed Funds Rate) via a static `JSON` economic calendar feed.
-* Utilizes a highly optimized $O(1)$ parsing loop to discard international events, tracking strictly high-impact `USD` shocks with safety lookahead bounds (max 7 days).
-* Engages a mathematical temporal deadlock (a configurable 30-minute lockout window before/after the event) to pause trading, preventing the bot from "picking up pennies in front of a steamroller" during scheduled macro volatility.
-
-### 5. Strict Temporal Risk Gates
-The bot enforces a highly specific mathematical "kill box" on the 15-minute Kalshi event timeline:
-* **Phase 1: Strike Window (Min 0-12 / 15 to 3 minutes left):** Active trade execution window. Ticks are ingested to warm up the statistical baseline (minimum 1000 ticks required).
-* **Phase 2: Illiquidity Lockdown (Min 12-15 / 180 to 0 seconds left):** Absolute lock. Spreads widen toxically; the bot deadlocks itself to prevent late-stage adverse selection.
+* Utilizes a highly optimized $O(1)$ parsing loop to discard international events, tracking strictly high-impact `USD` shocks with safety lookahead bounds (max 7 days) and a strict 512KB compression bomb check.
+* Engages a temporal lockout (a configurable 30-minute window before/after the event) to pause trading, preventing adverse selection during scheduled macro volatility.
 
 ---
 
 ## 🛡️ Execution & Risk Controls
 
-* **Multi-Asset Ingestion Support**: Actively trades five cryptocurrency pairs: **BTC-USD**, **HYPE-USD**, **SOL-USD**, **ETH-USD**, and **DOGE-USD**.
-* **Strict Capital Allocation**: Hard limits all executions to exactly 100 contracts (approx ~$100 max exposure per event) to securely manage drawdown risk during hyper-volatile liquidation wicks.
-* **Probability Floor**: Rejects any trade execution where `best_ask < 0.15` to avoid purchasing un-winnable low-probability options near expiration.
-* **DOGE Theta Volatility Filter**: Applies a relative volatility gate ($\le 0.005$) and Z-score proximity filter ($|Z| < 0.5$) to prevent entering range-bound decay strategies during macro wicks.
-* **Dynamic Take-Profit (Laddered Exit)**: Automatically distributes exit orders across 3 distinct tranches (bypassed for DOGE Theta Harvester):
-  * **Tranche 1 (Conservative 40%):** Locked at a strictly floored **50% ROI**.
-  * **Tranche 2 (Dynamic 35%):** Scales linearly between **50% and 85% ROI** depending on time remaining to event expiration.
-  * **Tranche 3 (Moonshot 25%):** Locked at an aggressive **95% ROI** maximum limit.
-  * **Mathematical Protection:** Employs `ROUND_UP` floating precision math and strict monotonic step constraints to ensure the exit ladder never mathematically collapses onto itself, even in illiquid conditions.
-* **Trailing Order Cancellation & Hold-To-Settle**: Upon event expiration timeout, all resting take-profit orders are force-cancelled with a 5-step retry loop to reconcile exact filled quantities. The DOGE Theta Harvester bypasses standard take-profit and sleeps until 2.0 seconds before expiration to execute a settlement payout.
+* **Strict Capital Allocation**: Hard limits all executions to a trade budget threshold (approx ~$100 max exposure per event) to securely manage drawdown risk.
+* **Rolling High-Water Mark Drawdown Circuit Breaker**: Measured as `(peak_balance - portfolio_val) / peak_balance` (quant peak-to-trough standard) rather than a static anchor. Tracks the equity peak monotonically inside the `balance_lock` and triggers an immediate halt if drawdown reaches `25%` (`DRAWDOWN_LIMIT_PCT`).
+* **Take-Profit (Laddered Exit)**: Automatically distributes exit orders across 3 distinct tranches:
+  * **Tranche 1 (Conservative 40%):** Target **50% ROI**.
+  * **Tranche 2 (Dynamic 35%):** Scales between **50% and 85% ROI** based on time remaining to event expiration.
+  * **Tranche 3 (Moonshot 25%):** Target **95% ROI** maximum limit.
+  * **Hold-to-Settle Optimization**: If **$\ge 2$ of 3** Take-Profit tranches cap at the maximum `$0.99` limit, the engine bypasses TP routing and falls back to Hold-to-Settle, minimizing exchange maker/taker fee overhead.
+* **Trailing Order Cancellation & Hold-To-Settle**: Expiries and buzzer-beater positions dynamically evaluate the final bid-ask price or spot vs. strike price at expiration to resolve payout delta entries accurately.
 
 ---
 
 ## 🔒 Security Posture & Zero-Trust Architecture
 
 The system is engineered assuming a strictly hostile network and execution environment:
-* **Exception Safety (Zero-Leak Execution)**: The `execute_and_hold_entry` setup block encloses all variables inside the primary `try:` block. Any setup exceptions trigger balance rollbacks (`except`) and concurrency slot release (`finally`), preventing slot and capital leakage.
-* **Double-Checked Locking (DCL) Concurrency Shield**: Checks position limit bounds locklessly, yields to retrieve market prices, and then validates state inside a synchronous `balance_lock` to stop duplicate execution races.
-* **Liskov Substitution Interface Alignment**: Method signature parameters for `get_order_details` are standardized using generic `**kwargs` across simulated, paper, and live brokers, eliminating runtime crashes.
-* **Cancel-Fill Race Condition Shield**: Implements cryptographic-grade validation loops during order cancellations. If a `cancel_order` request is rejected or is unconfirmed, the engine verifies details up to 5 times with jittered backoff.
-* **O(1) Orphan Fill Websocket Cache**: An advanced List-based array mapping intercepts and buffers WebSocket fills that resolve faster than the HTTP REST API edge router. By looping and enqueuing these partial fills instantaneously upon `execute_trade` resolution, the engine completely seals against TOCTOU dropped-fill phantom positions without violating memory bounds.
-* **Defensive Data Ingestion (Anti-Compression Bombs)**: External API fetches enforce rigid `Content-Length` bounds ($< 512$ KB) and exact MIME-type header validation (`application/json`) prior to deserialization, preventing Zip Bombs, HTML parsing crashes, and malicious control-character log injections.
-* **Heap Memory Cryptographic Hardening**: API credentials and keys are scrubbed immediately. String references are deleted (`del key_id`, `del private_key`), mutable buffers are zeroed using `ctypes.memset` in Secrets Manager parsing, `LiveKalshiBroker.close()` zeroes keys on termination, and a forced `gc.collect()` sweep wipes cleartext keys from memory page files.
-* **Zero-Trust Path Traversal Mitigation**: Every dynamic API variable is URL-encoded using `urllib.parse.quote(..., safe='')`, neutralizing parameter pollution and path traversal attacks.
-* **Identity Transparency**: Conforms strictly to third-party Terms of Service by passing honest User-Agent HTTP identifiers (`KalshiQuantEngine/1.0`), preventing WAF circumvention bans.
-* **Strict Asset Key Verification (C-1)**: Implements precise prefix-stripping and whitelist comparison against known bases (`BTC`, `ETH`, `SOL`, `DOGE`, `HYPE`) to eliminate regex ticker matching failures (e.g. `BTCM` bugs) that bypass trading frequency restrictions.
-* **Transactional Double-Counting Protection (C-2)**: Guarantees simulated balance transactional consistency by passing `0.00` available delta injections where direct simulated balance modifications are already completed.
-* **TP Routing Telemetry Guard (W-3)**: Prevents gaps in trading history records by ensuring `performance_tracker.record()` is written even during premature exits when Take-Profit order routing fails.
+* **WebSockets SSRF/DNS Rebinding Defense**: All incoming WS connections check target URLs against [is_safe_destination_async](file:///C:/Users/A2/OneDrive/Documents/Python Bots/kalshi_bot/kalshi_main.py#L387) pre-flight to prevent connections resolving to private loopback or internal metadata space.
+* **Health Check Rate Limiting**: Employs a per-source-IP sliding window rate limiter on the health server to protect the shared `asyncio` event loop against external DoS without interfering with orchestrator loopback health checks.
+* **Locked Capital Telemetry Filtering**: [get_locked_capital](file:///C:/Users/A2/OneDrive/Documents/Python Bots/kalshi_bot/kalshi_main.py#L828) aggregates only resting orders with `action == "buy"`, preventing resting sell/TP orders from inflating telemetry logs.
+* **Paper Trading Lock Boundaries**: Employs a dedicated `paper_orders_lock` within [LiveKalshiBroker](file:///C:/Users/A2/OneDrive/Documents/Python Bots/kalshi_bot/kalshi_main.py#L744) to guarantee thread-safe mutations of paper balance and paper order logs across async yields.
+* **Exception Safety (Zero-Leak Execution)**: Concurrency slots and balance tracking are managed in strict `finally` blocks, releasing capital slots instantly upon task cancellation.
+* **Double-Checked Locking (DCL) Concurrency Shield**: Checks position bounds locklessly, yields to retrieve market prices, and then validates state inside a synchronous `balance_lock` to stop duplicate execution races.
+* **Heap Memory Cryptographic Hardening**: Overwrites immutable string dictionary entries (`PRIVATE_KEY`, `KEY_ID`) inside Secrets Manager decoding, zeroes mutable `bytearray` buffers with `ctypes.memset`, and performs double `gc.collect()` passes on shutdown to eliminate OpenSSL key residency.
 
 ---
 
 ## 🧠 Memory & Concurrency Optimization
 
 Engineered to run infinitely without Out-Of-Memory (OOM) degradation or Garbage Collection (GC) stutter:
-* **Garbage Collection (GC) Freezing:** By deliberately decoupling from the Coinbase Level 2 WebSocket firehose and offloading indicator calculations to Rust, the engine prevents Python GC "Stop-The-World" pauses.
-* **Active Cooldown Guards:** Cooldown periods are locked during yields to prevent concurrent tick duplicate executions, and are immediately reset if a trade fails or returns early to ensure indicator calculations continue without interruption.
-* **Asynchronous Backpressure:** `asyncio.Queue(maxsize=...)` implements hard network boundary limits. In the event of a flash-crash, the system drops stale queue frames rather than allocating unmanageable heap pressure.
-* **Resilient Outage Backoff:** WebSocket consumers implement a truncated exponential backoff with random uniform jitter, protecting the container from CPU thrashing, log bloat, and IP rate-bans during prolonged exchange outages.
+* **Garbage Collection (GC) Freezing:** Decouples from heavy Level 2 feeds and offloads hot-path indicators (fast Bollinger Bands, RSI, Z-Scores) to compiled Rust `FastIndicators` structures to prevent Python GC "Stop-The-World" latency jitter.
+* **Active Cooldown Guards:** Cooldowns are locked during yields to prevent tick duplication, and are immediately reset if a trade returns early.
+* **Asynchronous Backpressure:** `asyncio.Queue` limits backpressure by dropping stale frames during flash-crash scenarios rather than allocating unmanageable heap buffers.
 
 ---
 
@@ -120,10 +103,3 @@ docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/kalshi-quant-engine:late
 # 5. Trigger ECS Zero-Downtime Rolling Deployment
 aws ecs update-service --cluster QuantCluster --service kalshi-bot-service --force-new-deployment
 ```
-
----
-
-## 🔮 Roadmap / Future Implementation
-
-* **Phase 10: PostgreSQL Telemetry Sink:** Stream CloudWatch fill/execution logs into TimescaleDB/PostgreSQL to perform long-term Expected Value (EV) backtesting analysis on Z-Score fade threshold optimizations.
-* **Phase 11: Out-of-Band Orderbook Imbalance (OBI):** If future statistical strategies dictate the need for resting L2 Depth tracking, engineer a native Cython or Rust C-Extension to manage Level 2 memory allocations entirely outside of the Python Global Interpreter Lock (GIL) and Garbage Collector.
