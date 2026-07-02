@@ -32,11 +32,13 @@ Waits exclusively for massive directional futures liquidations to capture explos
   * **Binance**: USDS-M perpetual liquidations.
   * **Bybit**: V5 linear perpetual liquidations (mapping Bybit position side to order direction).
   * **Hyperliquid**: Decentralized perpetual fills (detecting on-chain liquidation sub-objects).
-* **Time-Window Gate**: Restricted execution to a strict window of **1.5 to 8 minutes remaining** (`90.0 <= seconds_left <= 480.0`) to avoid early-event chop and late-event illiquidity.
+* **Dual-Regime Time-Window Gates**: Operating under two contiguous, non-overlapping temporal windows across the 15-minute event cycle:
+  * **Early Window (15m to 8m remaining - Mean Reversion Mode)**: Assumes early-stage wicks will pull back. Reverts the trade direction (buys `NO` on short liquidations, `YES` on long liquidations) and applies strict trend shield and Bollinger Band boundaries.
+  * **Golden Window (8m to 1.5m remaining - Momentum Breakout Mode)**: Standard directional sniping (buys `YES` on short liquidations, `NO` on long liquidations) to catch breakout runs.
 * **Spot-to-Strike Distance Gate**: Restricts entries to Out-of-the-Money (OTM) options only if the spot-to-strike distance is within $1.5 \times \text{Standard Deviation}$ ($\sigma$) derived from Bollinger Bands, dynamically scaling the gate with active market volatility.
 * **Pricing Consistency Gate**: Restricts OTM entries to a maximum purchase price of `$0.55` to prevent buying stale or illiquid markup contracts.
 * **Fallback Ingestion**: If Coinbase ticks are missing (e.g. for `HYPE-USD`), the engine utilizes the Binance/Bybit/Hyperliquid liquidation event price as a spot proxy to feed indicators and safety gates.
-* **Asset Performance Auto-Throttle**: Queries [PerformanceTracker](file:///C:/Users/A2/OneDrive/Documents/Python Bots/kalshi_bot/kalshi_main.py#L278) to throttle trades dynamically if the rolling outcome history (last 20 trades per asset/hour in a `deque`) yields a win rate $\le 35\%$ over at least 5 samples.
+* **Asset Performance Auto-Throttle**: Queries [PerformanceTracker](kalshi_main.py#L278) to throttle trades dynamically if the rolling outcome history (last 20 trades per asset/hour in a `deque`) yields a win rate $\le 35\%$ over at least 5 samples.
 
 ### 2. Z-Score Momentum Breakout / Mean Reversion Sniper - [DEACTIVATED]
 * *Status*: Commented out / disabled to prioritize liquidation breakout edge.
@@ -67,10 +69,10 @@ Fundamentally prevents the bot from trading during exogenous regime shifts.
 ## 🔒 Security Posture & Zero-Trust Architecture
 
 The system is engineered assuming a strictly hostile network and execution environment:
-* **WebSockets SSRF/DNS Rebinding Defense**: All incoming WS connections check target URLs against [is_safe_destination_async](file:///C:/Users/A2/OneDrive/Documents/Python Bots/kalshi_bot/kalshi_main.py#L387) pre-flight to prevent connections resolving to private loopback or internal metadata space. Applies to Coinbase, Binance, Bybit, and Hyperliquid client handshakes.
+* **WebSockets SSRF/DNS Rebinding Defense**: All incoming WS connections check target URLs against [is_safe_destination_async](kalshi_main.py#L387) pre-flight to prevent connections resolving to private loopback or internal metadata space. Applies to Coinbase, Binance, Bybit, and Hyperliquid client handshakes.
 * **Health Check Rate Limiting**: Employs a per-source-IP sliding window rate limiter on the health server to protect the shared `asyncio` event loop against external DoS without interfering with orchestrator loopback health checks.
-* **Locked Capital Telemetry Filtering**: [get_locked_capital](file:///C:/Users/A2/OneDrive/Documents/Python Bots/kalshi_bot/kalshi_main.py#L828) aggregates only resting orders with `action == "buy"`, preventing resting sell/TP orders from inflating telemetry logs.
-* **Paper Trading Lock Boundaries**: Employs a dedicated `paper_orders_lock` within [LiveKalshiBroker](file:///C:/Users/A2/OneDrive/Documents/Python Bots/kalshi_bot/kalshi_main.py#L744) to guarantee thread-safe mutations of paper balance and paper order logs across async yields.
+* **Locked Capital Telemetry Filtering**: [get_locked_capital](kalshi_main.py#L828) aggregates only resting orders with `action == "buy"`, preventing resting sell/TP orders from inflating telemetry logs.
+* **Paper Trading Lock Boundaries**: Employs a dedicated `paper_orders_lock` within [LiveKalshiBroker](kalshi_main.py#L744) to guarantee thread-safe mutations of paper balance and paper order logs across async yields.
 * **Exception Safety (Zero-Leak Execution)**: Concurrency slots and balance tracking are managed in strict `finally` blocks, releasing capital slots instantly upon task cancellation.
 * **Double-Checked Locking (DCL) Concurrency Shield**: Checks position bounds locklessly, yields to retrieve market prices, and then validates state inside a synchronous `balance_lock` to stop duplicate execution races.
 * **Heap Memory Cryptographic Hardening**: Overwrites immutable string dictionary entries (`PRIVATE_KEY`, `KEY_ID`) inside Secrets Manager decoding, zeroes mutable `bytearray` buffers with `ctypes.memset`, and performs double `gc.collect()` passes on shutdown to eliminate OpenSSL key residency.
@@ -95,7 +97,7 @@ This project utilizes an AWS ECR/ECS automated pipeline.
 ```bash
 # 1. Setup virtual env and compile Rust PyO3 indicators
 python -m venv venv
-$env:VIRTUAL_ENV="C:\Users\A2\OneDrive\Documents\Python Bots\kalshi_bot\venv"
+$env:VIRTUAL_ENV="venv"
 pip install -r requirements.txt maturin
 maturin develop --release
 

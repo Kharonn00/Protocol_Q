@@ -265,6 +265,7 @@ class AssetState:
 
         # Transitioned to O(1) Exponential Variables
         self.tick_count: int = 0
+        self.last_tick_time: float = 0.0
         self.fast_indicators = kalshi_bot.FastIndicators(14, float(config.EMA_ALPHA))
         self.consecutive_outliers: int = 0  
         
@@ -424,24 +425,35 @@ class MacroCircuitBreaker:
         self.active_events: List[EconomicEvent] = []
         self.calendar_url = os.environ.get("ECONOMIC_CALENDAR_URL", "")
         self._was_locked_out: bool = False
+        self.last_success_time: float = 0.0
 
     def is_locked_out(self) -> bool:
         current_time = time.time()
         locked = False
         active_event_name = ""
         
-        for ev in self.active_events:
-            if ev.impact == "HIGH":
-                start_lock = ev.timestamp - self.lockout_before
-                end_lock = ev.timestamp + self.lockout_after
-                if start_lock <= current_time <= end_lock:
-                    locked = True
-                    active_event_name = ev.event
-                    break
+        # Stale calendar data validation for live/paper environments
+        if self.calendar_url and os.environ.get("BOT_ENV", "simulation").lower() in ("live", "paper"):
+            if self.last_success_time == 0.0 or (current_time - self.last_success_time > 86400.0):
+                locked = True
+                active_event_name = "Stale Calendar Data"
+
+        if not locked:
+            for ev in self.active_events:
+                if ev.impact == "HIGH":
+                    start_lock = ev.timestamp - self.lockout_before
+                    end_lock = ev.timestamp + self.lockout_after
+                    if start_lock <= current_time <= end_lock:
+                        locked = True
+                        active_event_name = ev.event
+                        break
 
         if locked:
             if not self._was_locked_out:
-                logger.warning(f"[CIRCUIT BREAKER] Hard Lockout active near high-impact economic event: '{active_event_name}'. All entries blocked.")
+                if active_event_name == "Stale Calendar Data":
+                    logger.critical(f"[CIRCUIT BREAKER] Macro calendar data is stale (last success: {self.last_success_time}). Blocking all trades for safety.")
+                else:
+                    logger.warning(f"[CIRCUIT BREAKER] Hard Lockout active near high-impact economic event: '{active_event_name}'. All entries blocked.")
                 self._was_locked_out = True
         else:
             if self._was_locked_out:
@@ -535,7 +547,7 @@ class MacroCircuitBreaker:
                             continue
 
                         raw_event = item.get("title", "Economic Release")
-                        clean_event = "".join(c for c in raw_event if c.isalnum() or c in " -()%./")
+                        clean_event = "".join(c for c in raw_event if (c.isalnum() and c.isascii()) or c in " -()%./")
                         clean_event = clean_event[:100]
                         if not clean_event:
                             clean_event = "Economic Release"
@@ -559,6 +571,7 @@ class MacroCircuitBreaker:
                 reconstructed_response = {"events": mapped_events}
                 validated_data = EconomicCalendarResponse(**reconstructed_response)
                 self.active_events = validated_data.events
+                self.last_success_time = time.time()
                 return True
         except ValidationError as e:
             logger.error(f"[CIRCUIT BREAKER] Economic calendar structure schema mismatch: {sanitize_log_str(str(e))[:150]}")
@@ -1392,6 +1405,7 @@ class LiveTradingEngine:
         self.state_sequence: int = 0
         self.macro_trend: Dict[str, str] = {}
         self.last_blocked_log_time: Dict[str, float] = {}
+        self._last_drop_log_time: float = 0.0
         
         self.active_trade_count: int = 0
         self._binance_events_received: int = 0 
@@ -1659,6 +1673,7 @@ class LiveTradingEngine:
                 await asyncio.sleep(3600)
                 continue
                 
+            success = False
             try:
                 session = getattr(self.broker, "session", None)
                 if not session or session.closed:
@@ -1676,7 +1691,10 @@ class LiveTradingEngine:
             except Exception as e:
                 logger.error(f"[CIRCUIT BREAKER] Critical calendar update routine failure: {type(e).__name__}")
                 
-            await asyncio.sleep(21600)  # Refresh every 6 hours
+            if success:
+                await asyncio.sleep(21600)  # Refresh every 6 hours on success
+            else:
+                await asyncio.sleep(60)     # Retry in 60 seconds on failure
 
     async def sync_macro_trend_loop(self):
         """Fetches the 4-hour trend for major assets using Coinbase REST API."""
@@ -2203,7 +2221,7 @@ class LiveTradingEngine:
                                     last_sent_fill[oid] = executed
             except Exception as e:
                 logger.debug(f"Paper fill dispatcher error: {e}")
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(3.0)
     async def execute_and_hold_entry(self, state: AssetState, contract_id: str, side: str, limit_price: Decimal, quantity: int, total_cost: Decimal, seconds_left: float, hold_to_settle: bool = False):
         executing_strike = getattr(state, "strike_price", 0.0)
         order_id = None
@@ -2422,6 +2440,7 @@ class LiveTradingEngine:
                     state.fast_indicators = kalshi_bot.FastIndicators(14, float(config.EMA_ALPHA))
                     state.fast_indicators.add_price(tick_price)
                     state.tick_count = 1                  
+                    state.last_tick_time = time.time()
                     state.consecutive_outliers = 0
                     state.last_price = tick_price
                     return  
@@ -2435,6 +2454,7 @@ class LiveTradingEngine:
         
         # O(1) Variance & Mean Update via Rust PyO3 Extension
         state.tick_count += 1
+        state.last_tick_time = time.time()
         tick_volume = tick_dict.get("volume", 0.0)
         if tick_volume and tick_volume > 0:
             usd_notional_k = (float(tick_price) * float(tick_volume)) / 1000.0
@@ -2744,12 +2764,15 @@ class LiveTradingEngine:
             state = self.assets.get(asset_symbol)
             if not state or not state.active_contract_id: return
             
-            # BA-14: Ingest price from Binance liquidation as a spot proxy if Coinbase ticks are missing (e.g. HYPE-USD)
+            # BA-14: Ingest price from Binance liquidation as a spot proxy if Coinbase ticks are missing or stale (>15 seconds)
             liq_price = float(payload_dict["o"]["p"])
-            if state.last_price is None or asset_symbol == "HYPE-USD":
+            is_stale = (state.last_price is None or 
+                        (asset_symbol != "HYPE-USD" and time.time() - getattr(state, "last_tick_time", 0.0) > 15.0))
+            if is_stale or asset_symbol == "HYPE-USD":
                 state.last_price = liq_price
                 state.fast_indicators.add_price(liq_price)
                 state.tick_count += 1
+                state.last_tick_time = time.time()
                 
             # BA-01: Auto-throttle trades if PerformanceTracker signals a losing regime for this asset/hour
             current_hour = int(datetime.datetime.now(datetime.timezone.utc).hour)
@@ -2761,10 +2784,17 @@ class LiveTradingEngine:
             threshold = config.BINANCE_LIQUIDATION_THRESHOLDS.get(asset_symbol)
             if not threshold or notional < threshold: return 
 
+            current_time = time.time()
+            seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
+            if seconds_left < 90.0 or seconds_left > 900.0:
+                return
+            
+            is_mean_reversion = (seconds_left > 480.0)
+            
             if payload_dict["o"]["S"] == "SELL": 
-                trade_side = "NO"
+                trade_side = "YES" if is_mean_reversion else "NO"
             elif payload_dict["o"]["S"] == "BUY": 
-                trade_side = "YES"
+                trade_side = "NO" if is_mean_reversion else "YES"
             else: 
                 return
 
@@ -2775,11 +2805,40 @@ class LiveTradingEngine:
                 logger.warning(f"[{asset_symbol}] Dropping liquidation event — balance data is stale.")
                 return
             
-            current_time = time.time()
             if current_time < state.cooldown_until: return
             
-            seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
-            if seconds_left < 90.0 or seconds_left > 480.0: return
+            # --- EARLY-WINDOW MEAN REVERSION SAFETY FILTERS ---
+            if is_mean_reversion:
+                # Enforce minimum tick count for indicator warmup
+                if state.tick_count < 50:
+                    logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Indicator warmup in progress ({state.tick_count}/50 ticks).")
+                    return
+                
+                # 1. Macro Trend Shield check
+                macro = self.macro_trend.get(asset_symbol, "FLAT")
+                if trade_side == "YES" and macro == "DOWN":
+                    logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Trade is YES (bullish), but macro trend is DOWN.")
+                    return
+                if trade_side == "NO" and macro == "UP":
+                    logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Trade is NO (bearish), but macro trend is UP.")
+                    return
+                
+                # 2. Bollinger Band Volatility Gate check
+                mean, upper, lower = state.fast_indicators.get_bollinger_bands()
+                std_dev = (upper - mean) / 2.0
+                if std_dev < config.STD_DEV_FLOOR:
+                    logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Volatility too low (StdDev: {std_dev:.4f} < Floor: {config.STD_DEV_FLOOR}).")
+                    return
+                if upper > lower:
+                    current_spot = float(state.last_price)
+                    if trade_side == "YES":
+                        if current_spot > lower:
+                            logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Spot ${current_spot:.2f} has not crossed below lower Bollinger Band ${lower:.2f}.")
+                            return
+                    elif trade_side == "NO":
+                        if current_spot < upper:
+                            logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Spot ${current_spot:.2f} has not crossed above upper Bollinger Band ${upper:.2f}.")
+                            return
             
             executing_contract_id = state.active_contract_id
             
@@ -2804,8 +2863,15 @@ class LiveTradingEngine:
                     return
                 current_time = time.time()
                 seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
-                if seconds_left < 90.0 or seconds_left > 480.0:
+                if seconds_left < 90.0 or seconds_left > 900.0:
                     return
+                
+                # Re-validate that the regime did not shift during the yield
+                is_mean_reversion_post = (seconds_left > 480.0)
+                if is_mean_reversion_post != is_mean_reversion:
+                    logger.warning(f"[{asset_symbol}] Regime shift detected during network yield (Mean Reversion was {is_mean_reversion}, now {is_mean_reversion_post}). Aborting trade.")
+                    return
+                
                 if executing_contract_id != state.active_contract_id:
                     return
                     
@@ -2941,7 +3007,7 @@ async def coinbase_websocket_consumer(engine: LiveTradingEngine, queue: asyncio.
                 engine.shutting_down = True
                 break
             async with websockets.connect(uri, ssl=GLOBAL_SSL_CONTEXT, max_size=1048576, max_queue=256) as ws:
-                logger.debug("Connected to Coinbase Live Spot Feed.")
+                logger.info("Connected to Coinbase Live Spot Feed.")
                 await ws.send(orjson.dumps(subscribe_message).decode('utf-8'))
                 
                 async for message in ws:
@@ -2998,7 +3064,7 @@ async def binance_websocket_consumer(engine: LiveTradingEngine, queue: asyncio.Q
                 engine.shutting_down = True
                 break
             async with websockets.connect(uri, ssl=GLOBAL_SSL_CONTEXT, max_size=1048576, max_queue=256) as ws:
-                logger.debug("Connected to Binance Futures Feed.")
+                logger.info("Connected to Binance Futures Feed.")
                 async for message in ws:
                     if engine.shutting_down: break
                     if not reset_done and time.time() - conn_start > 10.0:
@@ -3138,7 +3204,7 @@ async def bybit_websocket_consumer(engine: LiveTradingEngine, queue: asyncio.Que
                 engine.shutting_down = True
                 break
             async with websockets.connect(uri, ssl=GLOBAL_SSL_CONTEXT, max_size=1048576, max_queue=256) as ws:
-                logger.debug("Connected to Bybit Futures Feed.")
+                logger.info("Connected to Bybit Futures Feed.")
                 await ws.send(orjson.dumps(subscribe_message).decode('utf-8'))
                 async for message in ws:
                     if engine.shutting_down: break
@@ -3216,7 +3282,7 @@ async def hyperliquid_websocket_consumer(engine: LiveTradingEngine, queue: async
                 engine.shutting_down = True
                 break
             async with websockets.connect(uri, ssl=GLOBAL_SSL_CONTEXT, max_size=1048576, max_queue=256) as ws:
-                logger.debug("Connected to Hyperliquid Trades Feed.")
+                logger.info("Connected to Hyperliquid Trades Feed.")
                 for sub_msg in subscribe_messages:
                     await ws.send(orjson.dumps(sub_msg).decode('utf-8'))
                     
@@ -3280,8 +3346,12 @@ async def binance_worker_loop(engine: LiveTradingEngine, queue: asyncio.Queue):
         try:
             ingress_time, message = await asyncio.wait_for(queue.get(), timeout=1.0)
             try: 
-                if time.time() - ingress_time > 1.5:
-                    logger.warning(f"[LATENCY GATE] Dropped stale liquidation event (queued for {time.time() - ingress_time:.2f}s)")
+                now = time.time()
+                if now - ingress_time > 1.5:
+                    last_drop_log = getattr(engine, "_last_drop_log_time", 0.0)
+                    if now - last_drop_log > 5.0:
+                        logger.warning(f"[LATENCY GATE] Dropping stale liquidation events due to queue congestion (queued for {now - ingress_time:.2f}s)")
+                        engine._last_drop_log_time = now
                     continue
                 # Spawn task in the background without awaiting it to eliminate Head-of-Line blocking
                 task = asyncio.create_task(engine.process_binance_liquidation(message))
