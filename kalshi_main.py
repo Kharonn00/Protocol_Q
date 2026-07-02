@@ -305,6 +305,10 @@ class PerformanceTracker:
     def record(self, asset: str, hour: int, won: bool, pnl: float):
         key = (self._clean_asset(asset), hour)
         if key not in self.outcomes:
+            # SEC-29: Cap total tracked keys to prevent unbounded growth, enforcing O(1) space invariant
+            if len(self.outcomes) >= 200:
+                oldest_key = next(iter(self.outcomes))
+                del self.outcomes[oldest_key]
             self.outcomes[key] = deque(maxlen=20)
         self.outcomes[key].append(won)
 
@@ -1149,7 +1153,7 @@ class LiveKalshiBroker(ExecutionBroker):
                             # Refund price improvement
                             self._paper_balance += (limit_price - best_ask) * Decimal(new_fills)
                             if cached_best_vals is not None:
-                                cached_best_vals[3] -= new_fills
+                                cached_best_vals[3] = max(0, cached_best_vals[3] - new_fills)  # SEC-31: Clamp to prevent negative depth
                             logger.warning(f"[PAPER BROKER PARTIAL] BUY fill: {new_fills}x {contract_id} '{side.upper()}' @ ${best_ask:.2f} (Total: {order_data['filled_quantity']}/{quantity})")
                     elif action == "sell" and best_bid >= limit_price:
                         # We are selling, so we consume the BID depth.
@@ -1158,7 +1162,7 @@ class LiveKalshiBroker(ExecutionBroker):
                             order_data["filled_quantity"] += new_fills
                             order_data["total_cost"] += Decimal(new_fills) * best_bid
                             if cached_best_vals is not None:
-                                cached_best_vals[2] -= new_fills
+                                cached_best_vals[2] = max(0, cached_best_vals[2] - new_fills)  # SEC-31: Clamp to prevent negative depth
                             # Credit actual execution price (best_bid)
                             self._paper_balance += best_bid * Decimal(new_fills)
                             logger.warning(f"[PAPER BROKER PARTIAL] SELL fill: {new_fills}x {contract_id} '{side.upper()}' @ ${best_bid:.2f} (Total: {order_data['filled_quantity']}/{quantity})")
@@ -2156,21 +2160,31 @@ class LiveTradingEngine:
                 contract_books = {}
                 for oid in active_ids:
                     if oid.startswith("paper-"):
-                        order_data = self.broker._paper_orders.get(oid)
-                        if order_data and order_data["status"] not in ("executed", "canceled"):
-                            cid = order_data["contract_id"]
-                            side = order_data["side"]
-                            cache_key = (cid, side)
-                            if cache_key not in contract_books:
-                                best_vals = await self.broker.get_best_bid_ask(cid, side)
-                                contract_books[cache_key] = list(best_vals) if best_vals else None
+                        # SEC-27: Acquire paper_orders_lock to prevent TOCTOU race with execute_trade/cancel_order
+                        async with self.broker.paper_orders_lock:
+                            order_data = self.broker._paper_orders.get(oid)
+                            if order_data and order_data["status"] not in ("executed", "canceled"):
+                                cid = order_data["contract_id"]
+                                side = order_data["side"]
+                            else:
+                                continue
+                        cache_key = (cid, side)
+                        if cache_key not in contract_books:
+                            best_vals = await self.broker.get_best_bid_ask(cid, side)
+                            contract_books[cache_key] = list(best_vals) if best_vals else None
                 
                 for oid in active_ids:
                     if oid.startswith("paper-"):
-                        order_data = self.broker._paper_orders.get(oid)
-                        if order_data:
-                            cid = order_data["contract_id"]
-                            side = order_data["side"]
+                        # SEC-27: Acquire paper_orders_lock for consistent read
+                        async with self.broker.paper_orders_lock:
+                            order_data = self.broker._paper_orders.get(oid)
+                            if order_data:
+                                cid = order_data["contract_id"]
+                                side = order_data["side"]
+                            else:
+                                cid = None
+                                side = None
+                        if cid is not None:
                             details = await self.broker.get_order_details(oid, simulate=True, cached_best_vals=contract_books.get((cid, side)))
                         else:
                             details = await self.broker.get_order_details(oid)
@@ -2694,7 +2708,7 @@ class LiveTradingEngine:
     # ==========================================
     # BINANCE LIQUIDATION SNIPER
     # ==========================================
-    async def process_binance_liquidation(self, raw_bytes: bytes):
+    async def process_binance_liquidation(self, event_data: Any):
         if self.shutting_down: return
         
         self._binance_events_received += 1
@@ -2709,11 +2723,13 @@ class LiveTradingEngine:
             logger.info(f"[HEARTBEAT] Binance Liquidation Sniper active and scanning... ({fmt_events} liquidations processed).")
             
         try:
-            parsed_dict = orjson.loads(raw_bytes)
-            # Support combined stream format where actual payload is wrapped in a "data" object
-            event_data = parsed_dict.get("data", parsed_dict)
-            
-            payload_dict = validate_binance_payload(event_data)
+            if isinstance(event_data, dict):
+                payload_dict = validate_binance_payload(event_data)
+            else:
+                parsed_dict = orjson.loads(event_data)
+                nested_data = parsed_dict.get("data", parsed_dict)
+                payload_dict = validate_binance_payload(nested_data)
+                
             if not payload_dict: 
                 return
                 
@@ -2934,11 +2950,11 @@ async def coinbase_websocket_consumer(engine: LiveTradingEngine, queue: asyncio.
                         attempt = 0  
                         reset_done = True
                     try: 
-                        queue.put_nowait(message)
+                        queue.put_nowait((time.time(), message))
                     except asyncio.QueueFull: 
                         engine.purge_memory(queue) 
                         try:
-                            queue.put_nowait(message)
+                            queue.put_nowait((time.time(), message))  # SEC-30: Must wrap in timestamp tuple to match worker unpack
                         except asyncio.QueueFull:
                             pass
                     
@@ -2958,8 +2974,11 @@ async def coinbase_websocket_consumer(engine: LiveTradingEngine, queue: asyncio.
 async def market_worker_loop(engine: LiveTradingEngine, queue: asyncio.Queue):
     while not engine.shutting_down:
         try:
-            message = await asyncio.wait_for(queue.get(), timeout=1.0)
-            try: await engine.process_live_tick(message)
+            ingress_time, message = await asyncio.wait_for(queue.get(), timeout=1.0)
+            try: 
+                if time.time() - ingress_time > 3.0:
+                    continue
+                await engine.process_live_tick(message)
             except Exception as e: logger.error("Tick fault", exc_info=True)
             finally: queue.task_done()
         except asyncio.TimeoutError:
@@ -2986,12 +3005,12 @@ async def binance_websocket_consumer(engine: LiveTradingEngine, queue: asyncio.Q
                         attempt = 0  
                         reset_done = True
                     try: 
-                        queue.put_nowait(message)
+                        queue.put_nowait((time.time(), message))
                     except asyncio.QueueFull: 
                         logger.warning("Binance queue overflow - purging and retrying.")
                         safe_drain_queue(queue)
                         try:
-                            queue.put_nowait(message)
+                            queue.put_nowait((time.time(), message))
                         except asyncio.QueueFull:
                             pass
                 
@@ -3095,14 +3114,181 @@ async def kalshi_websocket_consumer(engine: LiveTradingEngine):
             logger.warning(f"Kalshi WS error ({type(e).__name__}). Retrying in {delay:.2f}s...")
             await asyncio.sleep(delay)
 
+async def bybit_websocket_consumer(engine: LiveTradingEngine, queue: asyncio.Queue):
+    uri = "wss://stream.bybit.com/v5/public/linear"
+    subscribe_message = {
+        "op": "subscribe",
+        "args": [
+            "allLiquidation.BTCUSDT",
+            "allLiquidation.ETHUSDT",
+            "allLiquidation.SOLUSDT",
+            "allLiquidation.DOGEUSDT",
+            "allLiquidation.HYPEUSDT"
+        ]
+    }
+    
+    attempt = 0
+    max_attempts = 30
+    while not engine.shutting_down:
+        conn_start = time.time()
+        reset_done = False
+        try:
+            if not await is_safe_destination_async(uri):
+                logger.critical(f"[SECURITY] Aborting Bybit WS connection. Destination '{uri}' fails boundary rules.")
+                engine.shutting_down = True
+                break
+            async with websockets.connect(uri, ssl=GLOBAL_SSL_CONTEXT, max_size=1048576, max_queue=256) as ws:
+                logger.debug("Connected to Bybit Futures Feed.")
+                await ws.send(orjson.dumps(subscribe_message).decode('utf-8'))
+                async for message in ws:
+                    if engine.shutting_down: break
+                    if not reset_done and time.time() - conn_start > 10.0:
+                        attempt = 0  
+                        reset_done = True
+                    try:
+                        msg = orjson.loads(message)
+                        if "data" in msg:
+                            data_field = msg["data"]
+                            items = data_field if isinstance(data_field, list) else [data_field]
+                            for item in items:
+                                symbol = item.get("s")
+                                if not symbol:
+                                    continue
+                                bybit_side = item.get("S")
+                                if bybit_side == "Buy":
+                                    mapped_side = "SELL"
+                                elif bybit_side == "Sell":
+                                    mapped_side = "BUY"
+                                else:
+                                    continue
+                                
+                                normalized = {
+                                    "e": "forceOrder",
+                                    "o": {
+                                        "s": symbol,
+                                        "S": mapped_side,
+                                        "q": item.get("v"),
+                                        "p": item.get("p")
+                                    }
+                                }
+                                try:
+                                    queue.put_nowait((time.time(), normalized))
+                                except asyncio.QueueFull:
+                                    logger.warning("Liquidation queue overflow during Bybit ingestion - purging.")
+                                    safe_drain_queue(queue)
+                                    try:
+                                        queue.put_nowait((time.time(), normalized))  # SEC-28: Push consistent (timestamp, dict) tuple
+                                    except asyncio.QueueFull:
+                                        pass
+                    except Exception as parse_err:
+                        logger.warning(f"Error parsing Bybit WS frame: {parse_err}")
+                        
+        except Exception as e:
+            if not reset_done and time.time() - conn_start > 10.0:
+                attempt = 0
+            attempt += 1
+            if attempt > max_attempts:
+                logger.critical("[FATAL] Bybit connection limit reached. Stopping consumer.")
+                engine.shutting_down = True
+                break
+            delay = calculate_backoff_delay(attempt)
+            logger.warning(f"Bybit WS error ({type(e).__name__}). Retrying in {delay:.2f}s...")
+            await asyncio.sleep(delay)
+
+async def hyperliquid_websocket_consumer(engine: LiveTradingEngine, queue: asyncio.Queue):
+    uri = "wss://api.hyperliquid.xyz/ws"
+    subscribe_messages = [
+        {"method": "subscribe", "subscription": {"type": "trades", "coin": "BTC"}},
+        {"method": "subscribe", "subscription": {"type": "trades", "coin": "ETH"}},
+        {"method": "subscribe", "subscription": {"type": "trades", "coin": "SOL"}},
+        {"method": "subscribe", "subscription": {"type": "trades", "coin": "DOGE"}},
+        {"method": "subscribe", "subscription": {"type": "trades", "coin": "HYPE"}}
+    ]
+    
+    attempt = 0
+    max_attempts = 30
+    while not engine.shutting_down:
+        conn_start = time.time()
+        reset_done = False
+        try:
+            if not await is_safe_destination_async(uri):
+                logger.critical(f"[SECURITY] Aborting Hyperliquid WS connection. Destination '{uri}' fails boundary rules.")
+                engine.shutting_down = True
+                break
+            async with websockets.connect(uri, ssl=GLOBAL_SSL_CONTEXT, max_size=1048576, max_queue=256) as ws:
+                logger.debug("Connected to Hyperliquid Trades Feed.")
+                for sub_msg in subscribe_messages:
+                    await ws.send(orjson.dumps(sub_msg).decode('utf-8'))
+                    
+                async for message in ws:
+                    if engine.shutting_down: break
+                    if not reset_done and time.time() - conn_start > 10.0:
+                        attempt = 0  
+                        reset_done = True
+                    try:
+                        msg = orjson.loads(message)
+                        if msg.get("channel") == "trades" and "data" in msg:
+                            for trade in msg["data"]:
+                                if "liquidation" in trade:
+                                    coin = trade.get("coin")
+                                    if not coin:
+                                        continue
+                                    symbol = f"{coin}USDT"
+                                    hl_side = trade.get("side")
+                                    if hl_side == "A":
+                                        mapped_side = "SELL"
+                                    elif hl_side == "B":
+                                        mapped_side = "BUY"
+                                    else:
+                                        continue
+                                    
+                                    normalized = {
+                                        "e": "forceOrder",
+                                        "o": {
+                                            "s": symbol,
+                                            "S": mapped_side,
+                                            "q": trade.get("sz"),
+                                            "p": trade.get("px")
+                                        }
+                                    }
+                                    try:
+                                        queue.put_nowait((time.time(), normalized))
+                                    except asyncio.QueueFull:
+                                        logger.warning("Liquidation queue overflow during Hyperliquid ingestion - purging.")
+                                        safe_drain_queue(queue)
+                                        try:
+                                            queue.put_nowait((time.time(), normalized))  # SEC-28: Push consistent (timestamp, dict) tuple
+                                        except asyncio.QueueFull:
+                                            pass
+                    except Exception as parse_err:
+                        logger.warning(f"Error parsing Hyperliquid WS frame: {parse_err}")
+                        
+        except Exception as e:
+            if not reset_done and time.time() - conn_start > 10.0:
+                attempt = 0
+            attempt += 1
+            if attempt > max_attempts:
+                logger.critical("[FATAL] Hyperliquid connection limit reached. Stopping consumer.")
+                engine.shutting_down = True
+                break
+            delay = calculate_backoff_delay(attempt)
+            logger.warning(f"Hyperliquid WS error ({type(e).__name__}). Retrying in {delay:.2f}s...")
+            await asyncio.sleep(delay)
+
 async def binance_worker_loop(engine: LiveTradingEngine, queue: asyncio.Queue):
     while not engine.shutting_down:
         try:
-            message = await asyncio.wait_for(queue.get(), timeout=1.0)
+            ingress_time, message = await asyncio.wait_for(queue.get(), timeout=1.0)
             try: 
-                await engine.process_binance_liquidation(message)
+                if time.time() - ingress_time > 1.5:
+                    logger.warning(f"[LATENCY GATE] Dropped stale liquidation event (queued for {time.time() - ingress_time:.2f}s)")
+                    continue
+                # Spawn task in the background without awaiting it to eliminate Head-of-Line blocking
+                task = asyncio.create_task(engine.process_binance_liquidation(message))
+                engine._pending_tasks.add(task)
+                task.add_done_callback(engine._handle_task_done)
             except Exception as e: 
-                logger.error("Binance liquidation fault", exc_info=True)
+                logger.error("Binance liquidation task spawning fault", exc_info=True)
             finally: 
                 queue.task_done()
         except asyncio.TimeoutError:
@@ -3218,6 +3404,8 @@ if __name__ == "__main__":
                 tg.create_task(coinbase_websocket_consumer(engine, tick_queue), name="consumer")
                 tg.create_task(market_worker_loop(engine, tick_queue), name="worker")
                 tg.create_task(binance_websocket_consumer(engine, binance_queue), name="binance_consumer")
+                tg.create_task(bybit_websocket_consumer(engine, binance_queue), name="bybit_consumer")
+                tg.create_task(hyperliquid_websocket_consumer(engine, binance_queue), name="hyperliquid_consumer")
                 tg.create_task(binance_worker_loop(engine, binance_queue), name="binance_worker")
                 
                 if isinstance(broker, LiveKalshiBroker):

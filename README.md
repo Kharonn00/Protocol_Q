@@ -1,9 +1,9 @@
 # Kalshi Quantitative Trading Engine (KQTE)
 
 ## Executive Summary
-The Kalshi Quantitative Trading Engine is a high-frequency, fully asynchronous algorithmic trading daemon designed to execute asymmetric taker strategies on Kalshi's 15-minute Cryptocurrency Options markets. Built on absolute Zero-Trust security principles and strict $O(1)$ memory bounds, the engine aggregates Binance futures liquidation streams and Coinbase spot transaction feeds to perfectly time and snipe explosive macro-level breakouts in the Kalshi options chain.
+The Kalshi Quantitative Trading Engine is a high-frequency, fully asynchronous algorithmic trading daemon designed to execute asymmetric taker strategies on Kalshi's 15-minute Cryptocurrency Options markets. Built on absolute Zero-Trust security principles and strict $O(1)$ memory bounds, the engine aggregates Binance, Bybit, and Hyperliquid futures liquidation streams alongside Coinbase spot transaction feeds to perfectly time and snipe explosive macro-level breakouts in the Kalshi options chain.
 
-Currently deployed as an optimized, multi-stage AWS ECS Fargate service, the daemon operates the **Binance Liquidation Sniper** (Strategy 1) as its primary execution vehicle. Strategy 2 (Z-Score Sniper) and Strategy 3 (DOGE Theta Harvester) are **currently commented out / deactivated** to focus capital allocation strictly on high-leverage directional breakouts.
+Currently deployed as an optimized, multi-stage AWS ECS Fargate service, the daemon operates the **Liquidation Sniper** (Strategy 1) as its primary execution vehicle. Strategy 2 (Z-Score Sniper) and Strategy 3 (DOGE Theta Harvester) are **currently commented out / deactivated** to focus capital allocation strictly on high-leverage directional breakouts.
 
 ---
 
@@ -14,20 +14,28 @@ Currently deployed as an optimized, multi-stage AWS ECS Fargate service, the dae
 * **Orchestration:** AWS Elastic Container Service (ECS) with Fargate (`readonlyRootFilesystem: true`).
 * **State Management:** Fully stateless, ephemeral execution engine (Twelve-Factor App Compliant).
 * **Secret Management:** AWS Secrets Manager via `boto3` (No local key storage).
-* **Data Ingestion:** Multiplexed secure WebSockets (Coinbase Spot Tape `ticker`, Binance Futures `!forceOrder@arr`).
+* **Data Ingestion:** Multiplexed secure WebSockets:
+  * **Coinbase**: Spot transaction tape (`ticker`).
+  * **Binance**: Futures forced liquidation feed (`!forceOrder@arr`).
+  * **Bybit**: Linear futures public liquidation feed (`allLiquidation.{symbol}`).
+  * **Hyperliquid**: On-chain trades feed filtered for liquidation events (`trades`).
 * **Health Check & DoS Rate Limiting:** Exposed on TCP Port `8080` with a per-source-IP rate limiter (bypassed for internal loopback and private VPC IP addresses to prevent orchestrator termination loops).
 
 ---
 
 ## 📈 Quantitative Strategies
 
-### 1. The Binance Liquidation Sniper (Macro Breakouts) - [ACTIVE]
+### 1. The Liquidation Sniper (Multi-Exchange Macro Breakouts) - [ACTIVE]
 Waits exclusively for massive directional futures liquidations to capture explosive options chain momentum.
-* **Asset Support**: Tracks **BTC-USD** ($1.5M threshold), **ETH-USD** ($750k threshold), **SOL-USD** ($300k threshold), **DOGE-USD** ($300k threshold), and **HYPE-USD** ($100k threshold).
+* **Asset Support**: Tracks **BTC-USD**, **ETH-USD**, **SOL-USD**, **DOGE-USD**, and **HYPE-USD**.
+* **Exchange Streams**: Normalizes and ingests three distinct, public, non-authenticated real-time WebSockets:
+  * **Binance**: USDS-M perpetual liquidations.
+  * **Bybit**: V5 linear perpetual liquidations (mapping Bybit position side to order direction).
+  * **Hyperliquid**: Decentralized perpetual fills (detecting on-chain liquidation sub-objects).
 * **Time-Window Gate**: Restricted execution to a strict window of **1.5 to 8 minutes remaining** (`90.0 <= seconds_left <= 480.0`) to avoid early-event chop and late-event illiquidity.
 * **Spot-to-Strike Distance Gate**: Restricts entries to Out-of-the-Money (OTM) options only if the spot-to-strike distance is within $1.5 \times \text{Standard Deviation}$ ($\sigma$) derived from Bollinger Bands, dynamically scaling the gate with active market volatility.
 * **Pricing Consistency Gate**: Restricts OTM entries to a maximum purchase price of `$0.55` to prevent buying stale or illiquid markup contracts.
-* **Fallback Ingestion**: If Coinbase ticks are missing (e.g. for `HYPE-USD`), the engine utilizes the Binance liquidation event price as a spot proxy to feed standard technical indicators and safety gates.
+* **Fallback Ingestion**: If Coinbase ticks are missing (e.g. for `HYPE-USD`), the engine utilizes the Binance/Bybit/Hyperliquid liquidation event price as a spot proxy to feed indicators and safety gates.
 * **Asset Performance Auto-Throttle**: Queries [PerformanceTracker](file:///C:/Users/A2/OneDrive/Documents/Python Bots/kalshi_bot/kalshi_main.py#L278) to throttle trades dynamically if the rolling outcome history (last 20 trades per asset/hour in a `deque`) yields a win rate $\le 35\%$ over at least 5 samples.
 
 ### 2. Z-Score Momentum Breakout / Mean Reversion Sniper - [DEACTIVATED]
@@ -38,9 +46,8 @@ Waits exclusively for massive directional futures liquidations to capture explos
 
 ### 4. Macroeconomic Circuit Breaker (The Steamroller Defense) - [ACTIVE]
 Fundamentally prevents the bot from trading during exogenous regime shifts.
-* Fetches global economic schedules (e.g., CPI, FOMC, Fed Funds Rate) via a static `JSON` economic calendar feed.
-* Utilizes a highly optimized $O(1)$ parsing loop to discard international events, tracking strictly high-impact `USD` shocks with safety lookahead bounds (max 7 days) and a strict 512KB compression bomb check.
-* Engages a temporal lockout (a configurable 30-minute window before/after the event) to pause trading, preventing adverse selection during scheduled macro volatility.
+* Fetches economic releases schedule schedule via a static JSON feed.
+* Temporal lockout (30-minute window before/after the event) blocks trading, preventing adverse selection during high-impact USD economic events.
 
 ---
 
@@ -60,7 +67,7 @@ Fundamentally prevents the bot from trading during exogenous regime shifts.
 ## 🔒 Security Posture & Zero-Trust Architecture
 
 The system is engineered assuming a strictly hostile network and execution environment:
-* **WebSockets SSRF/DNS Rebinding Defense**: All incoming WS connections check target URLs against [is_safe_destination_async](file:///C:/Users/A2/OneDrive/Documents/Python Bots/kalshi_bot/kalshi_main.py#L387) pre-flight to prevent connections resolving to private loopback or internal metadata space.
+* **WebSockets SSRF/DNS Rebinding Defense**: All incoming WS connections check target URLs against [is_safe_destination_async](file:///C:/Users/A2/OneDrive/Documents/Python Bots/kalshi_bot/kalshi_main.py#L387) pre-flight to prevent connections resolving to private loopback or internal metadata space. Applies to Coinbase, Binance, Bybit, and Hyperliquid client handshakes.
 * **Health Check Rate Limiting**: Employs a per-source-IP sliding window rate limiter on the health server to protect the shared `asyncio` event loop against external DoS without interfering with orchestrator loopback health checks.
 * **Locked Capital Telemetry Filtering**: [get_locked_capital](file:///C:/Users/A2/OneDrive/Documents/Python Bots/kalshi_bot/kalshi_main.py#L828) aggregates only resting orders with `action == "buy"`, preventing resting sell/TP orders from inflating telemetry logs.
 * **Paper Trading Lock Boundaries**: Employs a dedicated `paper_orders_lock` within [LiveKalshiBroker](file:///C:/Users/A2/OneDrive/Documents/Python Bots/kalshi_bot/kalshi_main.py#L744) to guarantee thread-safe mutations of paper balance and paper order logs across async yields.
@@ -68,11 +75,13 @@ The system is engineered assuming a strictly hostile network and execution envir
 * **Double-Checked Locking (DCL) Concurrency Shield**: Checks position bounds locklessly, yields to retrieve market prices, and then validates state inside a synchronous `balance_lock` to stop duplicate execution races.
 * **Heap Memory Cryptographic Hardening**: Overwrites immutable string dictionary entries (`PRIVATE_KEY`, `KEY_ID`) inside Secrets Manager decoding, zeroes mutable `bytearray` buffers with `ctypes.memset`, and performs double `gc.collect()` passes on shutdown to eliminate OpenSSL key residency.
 
----
-
 ## 🧠 Memory & Concurrency Optimization
 
 Engineered to run infinitely without Out-Of-Memory (OOM) degradation or Garbage Collection (GC) stutter:
+* **Head-of-Line (HoL) Blocking Resolution**: Worker loops process incoming queue messages by spawning candidate breakout evaluations as independent, concurrent task wrappers (`asyncio.create_task`) rather than sequentially awaiting HTTP REST yields. This allows the worker loop to continuously drain the ingestion queue in microseconds.
+* **Latency Gate and Stale Signal Filtering**: Employs high-resolution ingress timestamps on all in-process queues (`tick_queue` and `binance_queue`) to automatically discard stale tick messages (> 3.0s age) and stale liquidation wicks (> 1.5s age).
+* **Double-Serialization Elimination**: Push raw Python dictionaries directly to the in-process queue from the Bybit and Hyperliquid feeds, bypassing CPU-intensive `orjson.dumps`/`loads` rounds and validating payloads polymorphically.
+* **Backpressure Overflow Fallback Safety**: Leverages custom queue-overflow overrides wrapping fallback pushes in correct timestamped tuples to prevent worker unpack crashes during extreme volatility peaks.
 * **Garbage Collection (GC) Freezing:** Decouples from heavy Level 2 feeds and offloads hot-path indicators (fast Bollinger Bands, RSI, Z-Scores) to compiled Rust `FastIndicators` structures to prevent Python GC "Stop-The-World" latency jitter.
 * **Active Cooldown Guards:** Cooldowns are locked during yields to prevent tick duplication, and are immediately reset if a trade returns early.
 * **Asynchronous Backpressure:** `asyncio.Queue` limits backpressure by dropping stale frames during flash-crash scenarios rather than allocating unmanageable heap buffers.
