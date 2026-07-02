@@ -67,7 +67,7 @@ class BotConfig:
         "ETH-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_ETH", "750000.0")),
         "DOGE-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_DOGE", "300000.0"))
     })
-    MAX_ALLOWED_SPREAD: Decimal = Decimal(os.environ.get("MAX_ALLOWED_SPREAD", "0.25"))
+    MAX_ALLOWED_SPREAD: Decimal = Decimal(os.environ.get("MAX_ALLOWED_SPREAD", "0.15"))
 
     Z_SCORE_THRESHOLD: float = float(os.environ.get("Z_SCORE_THRESHOLD", "3.0"))
     MIN_EMA_TICKS: int = int(os.environ.get("MIN_EMA_TICKS", "1000"))
