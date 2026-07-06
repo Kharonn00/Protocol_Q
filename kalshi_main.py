@@ -2814,14 +2814,14 @@ class LiveTradingEngine:
                     logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Indicator warmup in progress ({state.tick_count}/50 ticks).")
                     return
                 
-                # 1. Macro Trend Shield check
-                macro = self.macro_trend.get(asset_symbol, "FLAT")
-                if trade_side == "YES" and macro == "DOWN":
-                    logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Trade is YES (bullish), but macro trend is DOWN.")
-                    return
-                if trade_side == "NO" and macro == "UP":
-                    logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Trade is NO (bearish), but macro trend is UP.")
-                    return
+                # 1. Macro Trend Shield check (Commented out per user request)
+                # macro = self.macro_trend.get(asset_symbol, "FLAT")
+                # if trade_side == "YES" and macro == "DOWN":
+                #     logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Trade is YES (bullish), but macro trend is DOWN.")
+                #     return
+                # if trade_side == "NO" and macro == "UP":
+                #     logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Trade is NO (bearish), but macro trend is UP.")
+                #     return
                 
                 # 2. Bollinger Band Volatility Gate check
                 mean, upper, lower = state.fast_indicators.get_bollinger_bands()
