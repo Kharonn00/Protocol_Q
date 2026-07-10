@@ -67,14 +67,14 @@ class BotConfig:
         "ETH-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_ETH", "750000.0")),
         "DOGE-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_DOGE", "300000.0"))
     })
-    MAX_ALLOWED_SPREAD: Decimal = Decimal(os.environ.get("MAX_ALLOWED_SPREAD", "0.15"))
+    MAX_ALLOWED_SPREAD: Decimal = Decimal(os.environ.get("MAX_ALLOWED_SPREAD", "0.18"))
 
     Z_SCORE_THRESHOLD: float = float(os.environ.get("Z_SCORE_THRESHOLD", "3.0"))
     MIN_EMA_TICKS: int = int(os.environ.get("MIN_EMA_TICKS", "1000"))
     MAX_FADE_PRICE: Decimal = Decimal(os.environ.get("MAX_FADE_PRICE", "0.52"))
     MAX_PRICE_DEVIATION_PCT: float = 0.15      
     CONSECUTIVE_OUTLIER_LIMIT: int = 5         
-    STD_DEV_FLOOR: float = 0.05                
+    STD_DEV_FLOOR_PCT: float = float(os.environ.get("STD_DEV_FLOOR_PCT", "0.0005"))  # 0.05% of mean price
 
     LOCKOUT_BEFORE_SEC: float = float(os.environ.get("LOCKOUT_BEFORE_SEC", "1800.0"))
     LOCKOUT_AFTER_SEC: float = float(os.environ.get("LOCKOUT_AFTER_SEC", "1800.0"))
@@ -1620,7 +1620,8 @@ class LiveTradingEngine:
                             mean, upper, lower = state.fast_indicators.get_bollinger_bands()
                             std_dev = (upper - mean) / 2.0
                             
-                            if std_dev >= config.STD_DEV_FLOOR:
+                            effective_floor = mean * config.STD_DEV_FLOOR_PCT if mean > 0.0 else 0.0
+                            if std_dev >= effective_floor:
                                 z_score_val = (state.last_price - mean) / std_dev if std_dev > 0 else 0.0
                                 z_score_repr = f"{z_score_val:+.2f}"
                             else:
@@ -2826,18 +2827,20 @@ class LiveTradingEngine:
                 # 2. Bollinger Band Volatility Gate check
                 mean, upper, lower = state.fast_indicators.get_bollinger_bands()
                 std_dev = (upper - mean) / 2.0
-                if std_dev < config.STD_DEV_FLOOR:
-                    logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Volatility too low (StdDev: {std_dev:.4f} < Floor: {config.STD_DEV_FLOOR}).")
+                effective_floor = mean * config.STD_DEV_FLOOR_PCT if mean > 0.0 else 0.0
+                if std_dev < effective_floor:
+                    logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Volatility too low (StdDev: {std_dev:.4f} < Floor: {effective_floor:.4f}).")
                     return
                 if upper > lower:
                     current_spot = float(state.last_price)
+                    band_proximity = std_dev * 0.5  # R-1: Allow trades within 0.5x StdDev of the band
                     if trade_side == "YES":
-                        if current_spot > lower:
-                            logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Spot ${current_spot:.2f} has not crossed below lower Bollinger Band ${lower:.2f}.")
+                        if current_spot > lower + band_proximity:
+                            logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Spot ${current_spot:.2f} has not approached lower Bollinger Band ${lower:.2f} (proximity: {band_proximity:.2f}).")
                             return
                     elif trade_side == "NO":
-                        if current_spot < upper:
-                            logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Spot ${current_spot:.2f} has not crossed above upper Bollinger Band ${upper:.2f}.")
+                        if current_spot < upper - band_proximity:
+                            logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Spot ${current_spot:.2f} has not approached upper Bollinger Band ${upper:.2f} (proximity: {band_proximity:.2f}).")
                             return
             
             executing_contract_id = state.active_contract_id
@@ -2881,6 +2884,7 @@ class LiveTradingEngine:
                 # Dynamic spread limit based on bid price
                 max_spread = min(config.MAX_ALLOWED_SPREAD, max(Decimal("0.05"), best_bid * Decimal("0.30")))
                 if best_ask >= Decimal("0.85") or best_bid < Decimal("0.01") or best_ask < Decimal("0.15") or spread > max_spread:
+                    logger.debug(f"[{asset_symbol}] Silent drop: Orderbook rejected (Bid: ${best_bid}, Ask: ${best_ask}, Spread: ${spread}, MaxSpread: ${max_spread}).")
                     return
                     
                 limit_price = max(Decimal("0.01"), min(Decimal("0.99"), best_ask))
@@ -2893,7 +2897,8 @@ class LiveTradingEngine:
                     # Fetch running standard deviation from Bollinger Bands
                     mean, upper, lower = state.fast_indicators.get_bollinger_bands()
                     std_dev = (upper - mean) / 2.0
-                    std_dev_dec = Decimal(str(max(std_dev, float(config.STD_DEV_FLOOR))))
+                    effective_floor = mean * config.STD_DEV_FLOOR_PCT if mean > 0.0 else 0.0
+                    std_dev_dec = Decimal(str(max(std_dev, effective_floor)))
                     
                     if trade_side == "YES":
                         # YES is OTM if spot < strike
