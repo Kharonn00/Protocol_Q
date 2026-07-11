@@ -74,7 +74,13 @@ class BotConfig:
     MAX_FADE_PRICE: Decimal = Decimal(os.environ.get("MAX_FADE_PRICE", "0.52"))
     MAX_PRICE_DEVIATION_PCT: float = 0.15      
     CONSECUTIVE_OUTLIER_LIMIT: int = 5         
-    STD_DEV_FLOOR_PCT: float = float(os.environ.get("STD_DEV_FLOOR_PCT", "0.0005"))  # 0.05% of mean price
+    STD_DEV_FLOORS: Dict[str, float] = field(default_factory=lambda: {
+        "BTC-USD": float(os.environ.get("STD_DEV_FLOOR_BTC", "8.0")),
+        "ETH-USD": float(os.environ.get("STD_DEV_FLOOR_ETH", "0.50")),
+        "SOL-USD": float(os.environ.get("STD_DEV_FLOOR_SOL", "0.05")),
+        "DOGE-USD": float(os.environ.get("STD_DEV_FLOOR_DOGE", "0.0001")),
+        "HYPE-USD": float(os.environ.get("STD_DEV_FLOOR_HYPE", "0.05"))
+    })
 
     LOCKOUT_BEFORE_SEC: float = float(os.environ.get("LOCKOUT_BEFORE_SEC", "1800.0"))
     LOCKOUT_AFTER_SEC: float = float(os.environ.get("LOCKOUT_AFTER_SEC", "1800.0"))
@@ -111,6 +117,9 @@ class BotConfig:
             raise ValueError(f"LOCKOUT_AFTER_SEC={self.LOCKOUT_AFTER_SEC} out of safe range [0, 7200]")
         if not (Decimal("0.01") <= self.MAX_ALLOWED_SPREAD <= Decimal("0.50")):
             raise ValueError(f"MAX_ALLOWED_SPREAD={self.MAX_ALLOWED_SPREAD} out of safe range [0.01, 0.50]")
+        for asset, floor_val in self.STD_DEV_FLOORS.items():
+            if not (0.0 <= floor_val <= 1000.0):
+                raise ValueError(f"STD_DEV_FLOORS[{asset}]={floor_val} out of safe range [0.0, 1000.0]")
 
 config = BotConfig()
 
@@ -1620,8 +1629,8 @@ class LiveTradingEngine:
                             mean, upper, lower = state.fast_indicators.get_bollinger_bands()
                             std_dev = (upper - mean) / 2.0
                             
-                            effective_floor = mean * config.STD_DEV_FLOOR_PCT if mean > 0.0 else 0.0
-                            if std_dev >= effective_floor:
+                            floor = config.STD_DEV_FLOORS.get(symbol, 0.05)
+                            if std_dev >= floor:
                                 z_score_val = (state.last_price - mean) / std_dev if std_dev > 0 else 0.0
                                 z_score_repr = f"{z_score_val:+.2f}"
                             else:
@@ -2827,9 +2836,9 @@ class LiveTradingEngine:
                 # 2. Bollinger Band Volatility Gate check
                 mean, upper, lower = state.fast_indicators.get_bollinger_bands()
                 std_dev = (upper - mean) / 2.0
-                effective_floor = mean * config.STD_DEV_FLOOR_PCT if mean > 0.0 else 0.0
-                if std_dev < effective_floor:
-                    logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Volatility too low (StdDev: {std_dev:.4f} < Floor: {effective_floor:.4f}).")
+                floor = config.STD_DEV_FLOORS.get(asset_symbol, 0.05)
+                if std_dev < floor:
+                    logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Volatility too low (StdDev: {std_dev:.4f} < Floor: {floor:.4f}).")
                     return
                 if upper > lower:
                     current_spot = float(state.last_price)
@@ -2897,8 +2906,8 @@ class LiveTradingEngine:
                     # Fetch running standard deviation from Bollinger Bands
                     mean, upper, lower = state.fast_indicators.get_bollinger_bands()
                     std_dev = (upper - mean) / 2.0
-                    effective_floor = mean * config.STD_DEV_FLOOR_PCT if mean > 0.0 else 0.0
-                    std_dev_dec = Decimal(str(max(std_dev, effective_floor)))
+                    floor = config.STD_DEV_FLOORS.get(asset_symbol, 0.05)
+                    std_dev_dec = Decimal(str(max(std_dev, floor)))
                     
                     if trade_side == "YES":
                         # YES is OTM if spot < strike
