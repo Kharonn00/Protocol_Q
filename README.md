@@ -70,18 +70,21 @@ Fundamentally prevents the bot from trading during exogenous regime shifts.
 
 The system is engineered assuming a strictly hostile network and execution environment:
 * **WebSockets SSRF/DNS Rebinding Defense**: All incoming WS connections check target URLs against [is_safe_destination_async](kalshi_main.py#L387) pre-flight to prevent connections resolving to private loopback or internal metadata space. Applies to Coinbase, Binance, Bybit, and Hyperliquid client handshakes.
-* **Health Check Rate Limiting**: Employs a per-source-IP sliding window rate limiter on the health server to protect the shared `asyncio` event loop against external DoS without interfering with orchestrator loopback health checks.
+* **HTTP Redirect SSRF Prevention**: Forces `allow_redirects=False` on all external HTTP requests inside candle synchronization loops to prevent attackers from bypassing DNS resolver gates via HTTP 3xx redirects to local metadata.
+* **Trusted Proxy Client IP Resolution**: Health endpoint resolves `X-Forwarded-For` from right to left (to prevent header spoofing) strictly if the immediate connecting IP belongs to a private network (e.g. AWS ALB). Direct connections fallback to the socket IP.
+* **Health Check Rate Limiting**: Employs a per-source-IP sliding window rate limiter on the health server, with sliding eviction rather than full resets to prevent cache poisoning, and loopback/private connection bypasses.
 * **Locked Capital Telemetry Filtering**: [get_locked_capital](kalshi_main.py#L828) aggregates only resting orders with `action == "buy"`, preventing resting sell/TP orders from inflating telemetry logs.
 * **Paper Trading Lock Boundaries**: Employs a dedicated `paper_orders_lock` within [LiveKalshiBroker](kalshi_main.py#L744) to guarantee thread-safe mutations of paper balance and paper order logs across async yields.
-* **Exception Safety (Zero-Leak Execution)**: Concurrency slots and balance tracking are managed in strict `finally` blocks, releasing capital slots instantly upon task cancellation.
+* **Shielded Task Cancellation Cleanups (Zero-Leak Execution)**: Cleanup routines (order cancellation and final balance/position reconciliation) are wrapped in background coroutines shielded via `_safe_shield`, ensuring they execute to completion in the event loop even if the parent task is aborted or timed out.
 * **Double-Checked Locking (DCL) Concurrency Shield**: Checks position bounds locklessly, yields to retrieve market prices, and then validates state inside a synchronous `balance_lock` to stop duplicate execution races.
-* **Heap Memory Cryptographic Hardening**: Overwrites immutable string dictionary entries (`PRIVATE_KEY`, `KEY_ID`) inside Secrets Manager decoding, zeroes mutable `bytearray` buffers with `ctypes.memset`, and performs double `gc.collect()` passes on shutdown to eliminate OpenSSL key residency.
+* **Heap Memory Cryptographic Hardening**: Overwrites immutable string dictionary entries (`SecretString`, `PRIVATE_KEY`, `KEY_ID`) inside Secrets Manager decoding, zeroes mutable `bytearray` buffers with `ctypes.memset`, and performs double `gc.collect()` passes on shutdown to eliminate OpenSSL key residency.
 
 ## 🧠 Memory & Concurrency Optimization
 
 Engineered to run infinitely without Out-Of-Memory (OOM) degradation or Garbage Collection (GC) stutter:
 * **Head-of-Line (HoL) Blocking Resolution**: Worker loops process incoming queue messages by spawning candidate breakout evaluations as independent, concurrent task wrappers (`asyncio.create_task`) rather than sequentially awaiting HTTP REST yields. This allows the worker loop to continuously drain the ingestion queue in microseconds.
-* **Latency Gate and Stale Signal Filtering**: Employs high-resolution ingress timestamps on all in-process queues (`tick_queue` and `binance_queue`) to automatically discard stale tick messages (> 3.0s age) and stale liquidation wicks (> 1.5s age).
+* **Semaphore Queue Backpressure**: The worker loop yields on `semaphore.acquire()` *prior* to spawning tasks. This enforces true backpressure on ingestion queues under extreme volatility spikes, preventing memory exhaustion.
+* **Double-Checked Latency Gating**: Worker tasks re-evaluate the ingress timestamp *after* acquiring the semaphore. If the signal has been delayed by $>1.5$ seconds due to queue congestion, it is discarded and the semaphore is released, preventing trades on stale wicks.
 * **Double-Serialization Elimination**: Push raw Python dictionaries directly to the in-process queue from the Bybit and Hyperliquid feeds, bypassing CPU-intensive `orjson.dumps`/`loads` rounds and validating payloads polymorphically.
 * **Backpressure Overflow Fallback Safety**: Leverages custom queue-overflow overrides wrapping fallback pushes in correct timestamped tuples to prevent worker unpack crashes during extreme volatility peaks.
 * **Garbage Collection (GC) Freezing:** Decouples from heavy Level 2 feeds and offloads hot-path indicators (fast Bollinger Bands, RSI, Z-Scores) to compiled Rust `FastIndicators` structures to prevent Python GC "Stop-The-World" latency jitter.

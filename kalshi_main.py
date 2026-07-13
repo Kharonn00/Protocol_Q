@@ -616,8 +616,18 @@ async def handle_health_check(request: web.Request) -> web.Response:
     if request.method != "GET":
         return web.Response(status=405, text="Method Not Allowed")
     
-    # Bypass rate-limiter for loopback and private/VPC IP space (internal health checks)
+    # Securely resolve client IP behind reverse proxies (like ALB) using right-to-left traversal of X-Forwarded-For
+    x_forwarded_for = request.headers.get("X-Forwarded-For")
     remote_ip = request.remote or "127.0.0.1"
+    
+    # SEC-07c: Only resolve proxy IPs if the physical connector source is a private space (VPC/ALB)
+    if x_forwarded_for and is_private_ip(remote_ip):
+        for ip in reversed([ip.strip() for ip in x_forwarded_for.split(",")]):
+            if ip and not is_private_ip(ip):
+                remote_ip = ip
+                break
+                
+    # Bypass rate-limiter for loopback and private/VPC IP space (internal health checks)
     if is_private_ip(remote_ip):
         return web.json_response(
             {"status": "ok", "service": "kalshi-quant-engine"},
@@ -631,9 +641,11 @@ async def handle_health_check(request: web.Request) -> web.Response:
         
     limiters = app["health_limiter_ips"]
     
-    # Prevent memory exhaustion by capping tracking cache size
+    # Prevent memory exhaustion by capping tracking cache size (evict oldest instead of clearing all)
     if len(limiters) > 1000:
-        limiters.clear()
+        oldest_ips = sorted(limiters.keys(), key=lambda ip: limiters[ip]["window_start"])[:200]
+        for ip in oldest_ips:
+            limiters.pop(ip, None)
         
     now = time.time()
     if remote_ip not in limiters:
@@ -1720,7 +1732,7 @@ class LiveTradingEngine:
                             
                             headers = {"User-Agent": "KalshiQuantEngine/1.0", "Accept": "application/json"}
                             timeout = aiohttp.ClientTimeout(total=5.0)
-                            async with session.get(url, headers=headers, timeout=timeout) as response:
+                            async with session.get(url, headers=headers, timeout=timeout, allow_redirects=False) as response:
                                 if response.status == 200:
                                     body_bytes = await response.content.read(524288)
                                     if not body_bytes: continue
@@ -1742,7 +1754,7 @@ class LiveTradingEngine:
                         if await is_safe_destination_async(url):
                             headers = {"User-Agent": "KalshiQuantEngine/1.0", "Accept": "application/json"}
                             timeout = aiohttp.ClientTimeout(total=5.0)
-                            async with session.get(url, headers=headers, timeout=timeout) as response:
+                            async with session.get(url, headers=headers, timeout=timeout, allow_redirects=False) as response:
                                 if response.status == 200:
                                     body_bytes = await response.content.read(524288)
                                     if not body_bytes: pass
@@ -1759,9 +1771,8 @@ class LiveTradingEngine:
                                                 self.macro_trend["HYPE-USD"] = "FLAT"
                     except Exception as e:
                         logger.debug(f"[HYPE-USD] Macro sync internal error: {type(e).__name__}")
-                except Exception as e:
-                    logger.warning(f"[MACRO TREND] Sync failed: {type(e).__name__}")
-                
+                except Exception as loop_e:
+                    logger.error(f"Macro trend loop error: {type(loop_e).__name__}")
                 await asyncio.sleep(1800)
 
     async def _monitor_take_profit(self, state: AssetState, contract_id: str, side: str, entry_price: Decimal, quantity: int, seconds_left: float, hold_to_settle: bool = False, strike_price: Optional[float] = None):
@@ -1773,6 +1784,9 @@ class LiveTradingEngine:
         
         # Track previously reported fills per order to update local state incrementally
         order_ids = []
+        completed_orders = set()
+        last_reported_fill = {}
+        accumulated_fills = {}
         
         try:
             if not hold_to_settle:
@@ -1956,9 +1970,9 @@ class LiveTradingEngine:
                 timeout = max(0.0, seconds_left - 10.0)
                 
                 # Monotonic Unified Accumulator (fixes SEC-01)
-                last_reported_fill = {oid: 0 for oid, _, _, _ in order_ids}
-                accumulated_fills = {oid: 0 for oid, _, _, _ in order_ids}
-                completed_orders = set()
+                for oid, _, _, _ in order_ids:
+                    last_reported_fill[oid] = 0
+                    accumulated_fills[oid] = 0
                 start_time = time.time()
                 
                 while time.time() - start_time < timeout and len(completed_orders) < len(order_ids):
@@ -2166,12 +2180,40 @@ class LiveTradingEngine:
         except Exception as e:
             logger.error(f"[{contract_id}] Unhandled error in Take Profit monitor.", exc_info=True)
         finally:
-            unfilled = quantity - total_filled
-            if unfilled > 0:
-                # O(1) Memory Cleanup: Resolve simulated positions to prevent dictionary leak on expired settlements
-                if hasattr(self.broker, 'positions') and isinstance(self.broker.positions, dict):
-                    self.broker.positions.pop((contract_id, side.lower()), None)
-                await self._safe_shield(self._update_local_state(Decimal("0.00"), Decimal("0.00"), state, contract_id, -unfilled))
+            async def run_cleanup():
+                nonlocal total_filled, total_proceeds
+                for oid, oqty, oprice, olabel in order_ids:
+                    if oid not in completed_orders:
+                        try:
+                            logger.warning(f"[{contract_id}] Take-Profit task interrupted or ended with dangling orders. Cancelling {oid} ({olabel}) on exchange.")
+                            await self.broker.cancel_order(oid)
+                            
+                            try:
+                                details = await self.broker.get_order_details(oid, simulate=False)
+                                filled = self._get_filled_qty_from_details(details, oqty)
+                                accumulated_fills[oid] = max(accumulated_fills.get(oid, 0), filled)
+                                new_fills = accumulated_fills[oid] - last_reported_fill.get(oid, 0)
+                                if new_fills > 0:
+                                    total_filled += new_fills
+                                    total_proceeds += Decimal(new_fills) * oprice
+                                    await self._update_local_state(Decimal(new_fills) * oprice, Decimal("0.00"), state, contract_id, -new_fills)
+                                    last_reported_fill[oid] = accumulated_fills[oid]
+                                    logger.info(f"[{contract_id}] TP partial fill reconciled during cleanup: {filled}/{oqty}")
+                            except Exception as ex:
+                                logger.warning(f"[{contract_id}] Failed to reconcile order details during cancellation: {ex}")
+                            
+                            completed_orders.add(oid)
+                        except Exception as ce:
+                            logger.error(f"[{contract_id}] Failed to cancel order {oid} during TP cleanup: {ce}")
+                            
+                unfilled = quantity - total_filled
+                if unfilled > 0:
+                    # O(1) Memory Cleanup: Resolve simulated positions to prevent dictionary leak on expired settlements
+                    if hasattr(self.broker, 'positions') and isinstance(self.broker.positions, dict):
+                        self.broker.positions.pop((contract_id, side.lower()), None)
+                    await self._update_local_state(Decimal("0.00"), Decimal("0.00"), state, contract_id, -unfilled)
+
+            await self._safe_shield(run_cleanup())
 
     async def paper_fill_dispatcher(self):
         """Background loop for paper trading: simulates incremental order fills and pushes to active_tp_orders."""
@@ -2405,13 +2447,41 @@ class LiveTradingEngine:
 
         except (Exception, asyncio.CancelledError) as e:
             logger.critical(f"[{contract_id}] Unhandled exception or cancellation in entry manager. Forcing release.", exc_info=True)
-            if locked_capital > 0:
-                if not order_id:
-                    await release_locked_capital(locked_capital, -quantity)
-                else:
-                    # Order was placed, but we crashed mid-lifecycle.
-                    # Decrement capital_in_flight locally to avoid permanent leakage, and let sync loop reconcile.
-                    await release_locked_capital(Decimal("0.00"), -quantity)
+            if order_id:
+                async def cancel_and_reconcile():
+                    filled_qty = 0
+                    try:
+                        logger.warning(f"[{contract_id}] Entry manager cancelled/faulted. Cancelling order {order_id}.")
+                        await self.broker.cancel_order(order_id)
+                    except Exception as ce:
+                        logger.error(f"[{contract_id}] Failed to cancel order during cleanup: {ce}")
+                    
+                    try:
+                        details = await self.broker.get_order_details(order_id)
+                        filled_qty = self._get_filled_qty_from_details(details, quantity)
+                    except Exception as de:
+                        logger.error(f"[{contract_id}] Failed to get final details: {de}")
+                    
+                    if filled_qty > 0:
+                        unfilled_qty = quantity - filled_qty
+                        refund = Decimal(str(unfilled_qty)) * limit_price
+                        await release_locked_capital(refund, -unfilled_qty)
+                        try:
+                            tp_task = asyncio.create_task(self._monitor_take_profit(
+                                state, contract_id, side, _extract_fill_price(details, limit_price) if details else limit_price,
+                                filled_qty, seconds_left, hold_to_settle=hold_to_settle, strike_price=executing_strike
+                            ))
+                            self._pending_tasks.add(tp_task)
+                            tp_task.add_done_callback(self._handle_task_done)
+                        except Exception as tp_spawn_err:
+                            logger.critical(f"[{contract_id}] Failed to spawn TP task: {tp_spawn_err}")
+                    else:
+                        await release_locked_capital(locked_capital, -quantity)
+
+                await self._safe_shield(cancel_and_reconcile())
+            else:
+                if locked_capital > 0:
+                    await self._safe_shield(release_locked_capital(locked_capital, -quantity))
             raise
         finally:
             await self._safe_shield(self._decrement_trade_cap())
@@ -3356,19 +3426,29 @@ async def hyperliquid_websocket_consumer(engine: LiveTradingEngine, queue: async
             await asyncio.sleep(delay)
 
 async def binance_worker_loop(engine: LiveTradingEngine, queue: asyncio.Queue):
+    semaphore = asyncio.Semaphore(10) # Max 10 concurrent liquidation tasks
+
+    async def worker(ingress_time, message):
+        try:
+            now = time.time()
+            # Re-perform latency check after semaphore wait to prevent stale trades
+            if now - ingress_time > 1.5:
+                last_drop_log = getattr(engine, "_last_drop_log_time", 0.0)
+                if now - last_drop_log > 5.0:
+                    logger.warning(f"[LATENCY GATE] Dropping stale liquidation event inside worker (delayed by {now - ingress_time:.2f}s)")
+                    engine._last_drop_log_time = now
+                return
+            await engine.process_binance_liquidation(message)
+        finally:
+            semaphore.release()
+
     while not engine.shutting_down:
         try:
             ingress_time, message = await asyncio.wait_for(queue.get(), timeout=1.0)
             try: 
-                now = time.time()
-                if now - ingress_time > 1.5:
-                    last_drop_log = getattr(engine, "_last_drop_log_time", 0.0)
-                    if now - last_drop_log > 5.0:
-                        logger.warning(f"[LATENCY GATE] Dropping stale liquidation events due to queue congestion (queued for {now - ingress_time:.2f}s)")
-                        engine._last_drop_log_time = now
-                    continue
-                # Spawn task in the background without awaiting it to eliminate Head-of-Line blocking
-                task = asyncio.create_task(engine.process_binance_liquidation(message))
+                # Enforce true backpressure: wait for semaphore capacity before task spawning
+                await semaphore.acquire()
+                task = asyncio.create_task(worker(ingress_time, message))
                 engine._pending_tasks.add(task)
                 task.add_done_callback(engine._handle_task_done)
             except Exception as e: 
@@ -3391,6 +3471,10 @@ def get_kalshi_credentials(secret_name: str, region_name: str = "us-east-1") -> 
     try:
         response = client.get_secret_value(SecretId=secret_name)
         resp_json = response['SecretString']
+        
+        # SEC-13a: Overwrite the SecretString value in the response dict before deleting it
+        if isinstance(response, dict) and 'SecretString' in response:
+            response['SecretString'] = "X" * len(resp_json)
         
         # Scrub original response object immediately
         del response
