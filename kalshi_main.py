@@ -2913,8 +2913,8 @@ class LiveTradingEngine:
                         # YES is OTM if spot < strike
                         if spot_price < strike_price:
                             distance = strike_price - spot_price
-                            # 1. Distance Gate: Block if spot is more than 1.5 standard deviations OTM
-                            if distance > Decimal("1.5") * std_dev_dec:
+                            # 1. Distance Gate: Block if spot is more than 1.5 standard deviations OTM (Momentum breakout only)
+                            if not is_mean_reversion_post and distance > Decimal("1.5") * std_dev_dec:
                                 logger.info(f"[{asset_symbol}] Drop: YES trade blocked. Spot ${spot_price} is too far below Strike ${strike_price} (Dist: {distance:.2f} > 1.5 * StdDev: {Decimal('1.5') * std_dev_dec:.2f}).")
                                 return
                             # 2. Pricing Consistency Gate: Block if OTM option is overpriced (Lagging quote / wide spread markup)
@@ -2925,8 +2925,8 @@ class LiveTradingEngine:
                         # NO is OTM if spot > strike
                         if spot_price > strike_price:
                             distance = spot_price - strike_price
-                            # 1. Distance Gate: Block if spot is more than 1.5 standard deviations OTM
-                            if distance > Decimal("1.5") * std_dev_dec:
+                            # 1. Distance Gate: Block if spot is more than 1.5 standard deviations OTM (Momentum breakout only)
+                            if not is_mean_reversion_post and distance > Decimal("1.5") * std_dev_dec:
                                 logger.info(f"[{asset_symbol}] Drop: NO trade blocked. Spot ${spot_price} is too far above Strike ${strike_price} (Dist: {distance:.2f} > 1.5 * StdDev: {Decimal('1.5') * std_dev_dec:.2f}).")
                                 return
                             # 2. Pricing Consistency Gate: Block if OTM option is overpriced (Lagging quote / wide spread markup)
