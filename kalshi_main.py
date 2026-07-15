@@ -69,17 +69,15 @@ class BotConfig:
     })
     MAX_ALLOWED_SPREAD: Decimal = Decimal(os.environ.get("MAX_ALLOWED_SPREAD", "0.18"))
 
-    Z_SCORE_THRESHOLD: float = float(os.environ.get("Z_SCORE_THRESHOLD", "3.0"))
     MIN_EMA_TICKS: int = int(os.environ.get("MIN_EMA_TICKS", "1000"))
-    MAX_FADE_PRICE: Decimal = Decimal(os.environ.get("MAX_FADE_PRICE", "0.52"))
     MAX_PRICE_DEVIATION_PCT: float = 0.15      
     CONSECUTIVE_OUTLIER_LIMIT: int = 5         
-    STD_DEV_FLOORS: Dict[str, float] = field(default_factory=lambda: {
-        "BTC-USD": float(os.environ.get("STD_DEV_FLOOR_BTC", "8.0")),
-        "ETH-USD": float(os.environ.get("STD_DEV_FLOOR_ETH", "0.50")),
-        "SOL-USD": float(os.environ.get("STD_DEV_FLOOR_SOL", "0.05")),
-        "DOGE-USD": float(os.environ.get("STD_DEV_FLOOR_DOGE", "0.0001")),
-        "HYPE-USD": float(os.environ.get("STD_DEV_FLOOR_HYPE", "0.05"))
+    STD_DEV_FLOORS_PCT: Dict[str, float] = field(default_factory=lambda: {
+        "BTC-USD": float(os.environ.get("STD_DEV_FLOOR_PCT_BTC", "0.00013")),
+        "ETH-USD": float(os.environ.get("STD_DEV_FLOOR_PCT_ETH", "0.00016")),
+        "SOL-USD": float(os.environ.get("STD_DEV_FLOOR_PCT_SOL", "0.00033")),
+        "DOGE-USD": float(os.environ.get("STD_DEV_FLOOR_PCT_DOGE", "0.00066")),
+        "HYPE-USD": float(os.environ.get("STD_DEV_FLOOR_PCT_HYPE", "0.005"))
     })
 
     LOCKOUT_BEFORE_SEC: float = float(os.environ.get("LOCKOUT_BEFORE_SEC", "1800.0"))
@@ -94,14 +92,6 @@ class BotConfig:
     
     # Safety indicators thresholds
     STRIKE_SAFETY_BUFFER_SD: float = float(os.environ.get("STRIKE_SAFETY_BUFFER_SD", "0.5"))
-    RSI_OVERBOUGHT_THRESHOLD: float = float(os.environ.get("RSI_OVERBOUGHT_THRESHOLD", "70.0"))
-    RSI_OVERSOLD_THRESHOLD: float = float(os.environ.get("RSI_OVERSOLD_THRESHOLD", "30.0"))
-    TREND_ALIGNMENT_THRESHOLD: float = float(os.environ.get("TREND_ALIGNMENT_THRESHOLD", "0.0"))
-    
-    # 88% ROI Take-Profit Trap. Entry cost multiplied by 1.88.
-    TAKE_PROFIT_ROI: Decimal = Decimal(os.environ.get("TAKE_PROFIT_ROI", "1.88"))
-    
-    DOGE_THETA_MAX_REL_VOLATILITY: Decimal = Decimal(os.environ.get("DOGE_THETA_MAX_REL_VOLATILITY", "0.002"))
 
     def __post_init__(self):
         """SEC-06: Bounds-validate all environment-sourced config to prevent adversarial misconfiguration."""
@@ -109,17 +99,15 @@ class BotConfig:
             raise ValueError(f"TRADE_BUDGET_PCT={self.TRADE_BUDGET_PCT} out of safe range [0.001, 0.20]")
         if not (Decimal("0.05") <= self.DRAWDOWN_LIMIT_PCT <= Decimal("0.50")):
             raise ValueError(f"DRAWDOWN_LIMIT_PCT={self.DRAWDOWN_LIMIT_PCT} out of safe range [0.05, 0.50]")
-        if not (1.0 <= self.Z_SCORE_THRESHOLD <= 10.0):
-            raise ValueError(f"Z_SCORE_THRESHOLD={self.Z_SCORE_THRESHOLD} out of safe range [1.0, 10.0]")
         if not (0.0 <= self.LOCKOUT_BEFORE_SEC <= 7200.0):
             raise ValueError(f"LOCKOUT_BEFORE_SEC={self.LOCKOUT_BEFORE_SEC} out of safe range [0, 7200]")
         if not (0.0 <= self.LOCKOUT_AFTER_SEC <= 7200.0):
             raise ValueError(f"LOCKOUT_AFTER_SEC={self.LOCKOUT_AFTER_SEC} out of safe range [0, 7200]")
         if not (Decimal("0.01") <= self.MAX_ALLOWED_SPREAD <= Decimal("0.50")):
             raise ValueError(f"MAX_ALLOWED_SPREAD={self.MAX_ALLOWED_SPREAD} out of safe range [0.01, 0.50]")
-        for asset, floor_val in self.STD_DEV_FLOORS.items():
-            if not (0.0 <= floor_val <= 1000.0):
-                raise ValueError(f"STD_DEV_FLOORS[{asset}]={floor_val} out of safe range [0.0, 1000.0]")
+        for asset, floor_val in self.STD_DEV_FLOORS_PCT.items():
+            if not (0.0 <= floor_val <= 1.0):
+                raise ValueError(f"STD_DEV_FLOORS_PCT[{asset}]={floor_val} out of safe range [0.0, 1.0]")
 
 config = BotConfig()
 
@@ -808,8 +796,9 @@ class LiveKalshiBroker(ExecutionBroker):
         self.VALID_ACTIONS = frozenset({"buy", "sell"})
         self.VALID_SIDES = frozenset({"yes", "no"})
         
-        self.timeout_short = aiohttp.ClientTimeout(total=2.0)
-        self.timeout_long = aiohttp.ClientTimeout(total=3.0)
+        # Short/Long REST timeouts to prevent worker task starvation during exchange lag
+        self.timeout_short = aiohttp.ClientTimeout(total=float(os.environ.get("REST_TIMEOUT_SHORT", "0.75")))
+        self.timeout_long = aiohttp.ClientTimeout(total=float(os.environ.get("REST_TIMEOUT_LONG", "1.5")))
         self.private_key = private_key
 
     async def start(self):
@@ -1641,7 +1630,8 @@ class LiveTradingEngine:
                             mean, upper, lower = state.fast_indicators.get_bollinger_bands()
                             std_dev = (upper - mean) / 2.0
                             
-                            floor = config.STD_DEV_FLOORS.get(symbol, 0.05)
+                            floor_pct = config.STD_DEV_FLOORS_PCT.get(symbol, 0.0005)
+                            floor = floor_pct * float(state.last_price)
                             if std_dev >= floor:
                                 z_score_val = (state.last_price - mean) / std_dev if std_dev > 0 else 0.0
                                 z_score_repr = f"{z_score_val:+.2f}"
@@ -2542,268 +2532,7 @@ class LiveTradingEngine:
         else:
             state.fast_indicators.add_price(tick_price)
 
-        if current_time < state.cooldown_until:
-            state.last_price = float(tick_price)
-            return
-
-        if self.circuit_breaker.is_locked_out():
-            state.last_price = tick_price
-            return
-
-        last_price = state.last_price
-        state.last_price = tick_price
-        if not last_price: return
-
-        # (Dead code for indicator caching and pre-execution guards removed per Security Audit ADV-1)
-        
-        # -------------------------------------------------------------
-        # Z-SCORE MOMENTUM BREAKOUT SNIPER
-        # -------------------------------------------------------------
-        if state.tick_count < config.MIN_EMA_TICKS: return
-        
-        z_score = state.fast_indicators.get_z_score()
-        seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
-
-        # -------------------------------------------------------------
-        # STRATEGY 3: DOGE THETA HARVESTER
-        # -------------------------------------------------------------
-        if False and product_id == "DOGE-USD":
-            if not state.active_contract_id: return
-            if 120.0 <= seconds_left <= 300.0:
-                # Volatility gate: verify relative volatility is low and Z-score is near zero
-                mean, upper, lower = state.fast_indicators.get_bollinger_bands()
-                std_dev = (upper - mean) / 2.0
-                rel_std_dev = std_dev / mean if mean > 0.0 else 0.0
-                
-                macro = self.macro_trend.get(product_id, "FLAT")
-                if macro == "FLAT" and rel_std_dev <= float(config.DOGE_THETA_MAX_REL_VOLATILITY) and (z_score == 0.0 or abs(z_score) < 0.5):
-                    executing_contract_id = state.active_contract_id
-                    if executing_contract_id == getattr(state, "last_traded_event", ""): pass # Let it fall through to Strategy 2
-                    else:
-                        slot_acquired = False
-                        local_mutated = False
-                        try:
-                            async with self.trade_cap_lock:
-                                if self.active_trade_count >= config.MAX_CONCURRENT_TRADES: pass
-                                else:
-                                    self.active_trade_count += 1
-                                    slot_acquired = True
-                                
-                            if slot_acquired:
-                                state.cooldown_until = current_time + 15.0
-                                best_yes_vals, best_no_vals = await asyncio.gather(
-                                    self.broker.get_best_bid_ask(executing_contract_id, "YES"),
-                                    self.broker.get_best_bid_ask(executing_contract_id, "NO")
-                                )
-                                
-                                trade_side = None
-                                limit_price = Decimal("0.00")
-                                
-                                if best_yes_vals and Decimal("0.80") <= best_yes_vals[1] <= Decimal("0.90"):
-                                    trade_side = "YES"
-                                    limit_price = best_yes_vals[1]
-                                elif best_no_vals and Decimal("0.80") <= best_no_vals[1] <= Decimal("0.90"):
-                                    trade_side = "NO"
-                                    limit_price = best_no_vals[1]
-                                    
-                                if trade_side:
-                                    current_time = time.time()
-                                    seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
-                                    
-                                    # TOCTOU recheck after await yield
-                                    macro_check = self.macro_trend.get(product_id, "FLAT")
-                                    if self.circuit_breaker.is_locked_out():
-                                        should_decrement = True
-                                    elif macro_check != "FLAT":
-                                        should_decrement = True
-                                    elif not (120.0 <= seconds_left <= 300.0) or executing_contract_id != state.active_contract_id:
-                                        should_decrement = True
-                                    else:
-                                        should_decrement = False
-                                        async with self.balance_lock:
-                                            if executing_contract_id == getattr(state, "last_traded_event", ""):
-                                                should_decrement = True
-                                            else:
-                                                trade_budget = self.available_balance * config.TRADE_BUDGET_PCT
-                                                raw_quantity = int(trade_budget / limit_price)
-                                                quantity = min(raw_quantity, config.MAX_CONTRACTS_PER_TRADE, 50) # Harvester max 50 contracts
-                                                
-                                                if quantity < 30: # STRICT 30-CONTRACT MINIMUM FOR FEE STRUCTURE
-                                                    should_decrement = True
-                                                else:
-                                                    total_cost = Decimal(quantity) * limit_price
-                                                    if self.available_balance >= total_cost:
-                                                        self.available_balance -= total_cost
-                                                        self.capital_in_flight += total_cost
-                                                        state.position_sides[executing_contract_id] = trade_side
-                                                        state.positions[executing_contract_id] = state.positions.get(executing_contract_id, 0) + quantity
-                                                        state.last_traded_event = executing_contract_id # REINSTATED 1 TRADE LIMIT
-                                                        state.cooldown_until = current_time + 15.0
-                                                        self.state_sequence += 1
-                                                        local_mutated = True
-                                                    else:
-                                                        should_decrement = True
-                                                    
-                                    if not should_decrement:
-                                        logger.warning(f"[{product_id}] THETA HARVESTER ACTIVE! Ask: ${limit_price:.2f} | Sniping {quantity} {trade_side} contracts.")
-                                        exec_task = asyncio.create_task(
-                                            self.execute_and_hold_entry(
-                                                state, executing_contract_id, trade_side, limit_price, quantity, total_cost, seconds_left, hold_to_settle=True
-                                            )
-                                        )
-                                        self._pending_tasks.add(exec_task)
-                                        exec_task.add_done_callback(self._handle_task_done)
-                                        slot_acquired = False
-                        except Exception as e:
-                            logger.error("DOGE Theta Harvester fault", exc_info=True)
-                            if 'exec_task' in locals():
-                                if not exec_task.done():
-                                    exec_task.cancel()
-                            if local_mutated and slot_acquired:
-                                await self._safe_shield(self._update_local_state(total_cost, -total_cost, state, executing_contract_id, -quantity))
-                                if getattr(state, "last_traded_event", "") == executing_contract_id:
-                                    state.last_traded_event = ""
-                        finally:
-                            if slot_acquired:
-                                await self._safe_shield(self._decrement_trade_cap())
-            # Removed unconditional `return` here so DOGE can fall through to Strategy 2 (Z-Score Breakout) if Theta Harvester conditions aren't met
-            
-        # -------------------------------------------------------------
-        # STRATEGY 2: TREND-FILTERED SNIPER (DOGE-USD Only / Fallback)
-        # -------------------------------------------------------------
-        # Option A: Z-Score sniper disabled for all assets except DOGE-USD (where it acts as a Theta Harvester fallback/breakout sniper)
-        return  # Strategy 2 Z-Score Sniper completely disabled
-
-        if abs(z_score) < config.Z_SCORE_THRESHOLD: return
-
-        if not state.active_contract_id: return
-        
-        # The Golden Window: 8 minutes to 3 minutes remaining
-        if seconds_left < 180.0 or seconds_left > 480.0: return
-        
-        # Swapped logic for BTC-USD to trade mean reversion (buy NO on spikes, YES on dips)
-        if product_id == "BTC-USD":
-            trade_side = "NO" if z_score > 0 else "YES"
-            strat_label = "Mean Reversion"
-        else:
-            trade_side = "YES" if z_score > 0 else "NO"
-            strat_label = "Breakout"
-        
-        # Apply 4-Hour Macro Trend Shield
-        macro = self.macro_trend.get(product_id, "FLAT")
-        if trade_side == "YES" and macro == "DOWN":
-            if time.time() - self.last_blocked_log_time.get(product_id, 0.0) > 60.0:
-                logger.warning(f"[{product_id}] Z-Score {strat_label} (+{z_score:.2f}) BLOCKED by 4H Bearish Trend (Bull Trap Prevented). [Silencing log for 60s]")
-                self.last_blocked_log_time[product_id] = time.time()
-            return
-        if trade_side == "NO" and macro == "UP":
-            if time.time() - self.last_blocked_log_time.get(product_id, 0.0) > 60.0:
-                logger.warning(f"[{product_id}] Z-Score {strat_label} ({z_score:.2f}) BLOCKED by 4H Bullish Trend (Bear Trap Prevented). [Silencing log for 60s]")
-                self.last_blocked_log_time[product_id] = time.time()
-            return
-        executing_contract_id = state.active_contract_id
-        
-        # One trade per asset per event guard
-        if executing_contract_id == getattr(state, "last_traded_event", ""): return
-        
-        slot_acquired = False
-        local_mutated = False
-        try:
-            async with self.trade_cap_lock:
-                if self.active_trade_count >= config.MAX_CONCURRENT_TRADES: return
-                self.active_trade_count += 1
-                slot_acquired = True
-                
-            state.cooldown_until = current_time + 15.0
-            best_vals = await self.broker.get_best_bid_ask(executing_contract_id, trade_side)
-            if not best_vals:
-                return
-                
-            # TOCTOU Security Fixes
-            if self.circuit_breaker.is_locked_out():
-                return
-            current_time = time.time()
-            seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
-            if seconds_left < 180.0 or seconds_left > 480.0:
-                return
-            if executing_contract_id != state.active_contract_id:
-                return
-                
-            macro_check = self.macro_trend.get(product_id, "FLAT")
-            if trade_side == "YES" and macro_check == "DOWN": return
-            if trade_side == "NO" and macro_check == "UP": return
-                
-            best_bid, best_ask, bid_depth, ask_depth = best_vals
-            spread = best_ask - best_bid
-            
-            max_spread = min(config.MAX_ALLOWED_SPREAD, max(Decimal("0.05"), best_bid * Decimal("0.30")))
-            if best_ask >= Decimal("0.85") or best_bid < Decimal("0.01") or best_ask < Decimal("0.15") or spread > max_spread:
-                return
-                
-            limit_price = max(Decimal("0.01"), min(Decimal("0.99"), best_ask))
-            
-            should_decrement = False
-            async with self.balance_lock:
-                if executing_contract_id == getattr(state, "last_traded_event", ""):
-                    should_decrement = True
-                else:
-                    current_pos_side = state.position_sides.get(executing_contract_id)
-                    if current_pos_side and current_pos_side != trade_side:
-                        should_decrement = True
-                    else:
-                        actual_pos_size = state.positions.get(executing_contract_id, 0)
-                        remaining_exposure = config.MAX_EXPOSURE_PER_EVENT - actual_pos_size
-                        if remaining_exposure <= 0:
-                            should_decrement = True
-                        else:
-                            trade_budget = self.available_balance * config.TRADE_BUDGET_PCT
-                            raw_quantity = int(trade_budget / limit_price)
-                            quantity = min(raw_quantity, config.MAX_CONTRACTS_PER_TRADE, remaining_exposure)
-                            
-                            if quantity < 30:
-                                should_decrement = True
-                            else:
-                                total_cost = Decimal(quantity) * limit_price
-                                if self.available_balance >= total_cost:
-                                    self.available_balance -= total_cost
-                                    self.capital_in_flight += total_cost
-                                    
-                                    state.position_sides[executing_contract_id] = trade_side
-                                    state.positions[executing_contract_id] = actual_pos_size + quantity
-                                    state.last_traded_event = executing_contract_id
-                                    state.cooldown_until = current_time + 15.0
-                                    self.state_sequence += 1
-                                    local_mutated = True
-                                else:
-                                    should_decrement = True
-            
-            if should_decrement:
-                return
-            
-            logger.warning(f"[{product_id}] Z-SCORE {strat_label.upper()} ({z_score:.2f})! Ask: ${best_ask:.2f} | Sniping {quantity} contracts.")
-            
-            exec_task = asyncio.create_task(
-                self.execute_and_hold_entry(
-                    state, executing_contract_id, trade_side, limit_price, quantity, total_cost, seconds_left
-                )
-            )
-            # Safe handoff: explicitly secure strong reference first
-            self._pending_tasks.add(exec_task)
-            exec_task.add_done_callback(self._handle_task_done)
-            slot_acquired = False
-        except Exception as e:
-            logger.error("Z-Score Momentum processing fault", exc_info=True) 
-            if 'exec_task' in locals():
-                if not exec_task.done():
-                    exec_task.cancel()
-            if local_mutated and slot_acquired:
-                # Revert leaked local balance if task creation failed
-                await self._safe_shield(self._update_local_state(total_cost, -total_cost, state, executing_contract_id, -quantity))
-                if getattr(state, "last_traded_event", "") == executing_contract_id:
-                    state.last_traded_event = ""
-        finally:
-            if slot_acquired:
-                await self._safe_shield(self._decrement_trade_cap())
+        state.last_price = float(tick_price)
 
     # ==========================================
     # BINANCE LIQUIDATION SNIPER
@@ -2906,7 +2635,9 @@ class LiveTradingEngine:
                 # 2. Bollinger Band Volatility Gate check
                 mean, upper, lower = state.fast_indicators.get_bollinger_bands()
                 std_dev = (upper - mean) / 2.0
-                floor = config.STD_DEV_FLOORS.get(asset_symbol, 0.05)
+                current_spot = float(state.last_price) if state.last_price is not None else 0.0
+                floor_pct = config.STD_DEV_FLOORS_PCT.get(asset_symbol, 0.0005)
+                floor = floor_pct * current_spot
                 if std_dev < floor:
                     logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Volatility too low (StdDev: {std_dev:.4f} < Floor: {floor:.4f}).")
                     return
@@ -2976,7 +2707,8 @@ class LiveTradingEngine:
                     # Fetch running standard deviation from Bollinger Bands
                     mean, upper, lower = state.fast_indicators.get_bollinger_bands()
                     std_dev = (upper - mean) / 2.0
-                    floor = config.STD_DEV_FLOORS.get(asset_symbol, 0.05)
+                    floor_pct = config.STD_DEV_FLOORS_PCT.get(asset_symbol, 0.0005)
+                    floor = floor_pct * float(state.last_price)
                     std_dev_dec = Decimal(str(max(std_dev, floor)))
                     
                     if trade_side == "YES":
