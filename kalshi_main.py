@@ -2869,7 +2869,7 @@ class LiveTradingEngine:
             if seconds_left < 90.0 or seconds_left > 900.0:
                 return
             
-            is_mean_reversion = (seconds_left > 480.0)
+            is_mean_reversion = (seconds_left > 600.0)
             
             if payload_dict["o"]["S"] == "SELL": 
                 trade_side = "YES" if is_mean_reversion else "NO"
@@ -2912,7 +2912,7 @@ class LiveTradingEngine:
                     return
                 if upper > lower:
                     current_spot = float(state.last_price)
-                    band_proximity = std_dev * 0.75  # R-1: Allow trades within 0.75x StdDev of the band
+                    band_proximity = std_dev * 0.5  # R-1: Allow trades within 0.5x StdDev of the band
                     if trade_side == "YES":
                         if current_spot > lower + band_proximity:
                             logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Spot ${current_spot:.2f} has not approached lower Bollinger Band ${lower:.2f} (proximity: {band_proximity:.2f}).")
@@ -2949,7 +2949,7 @@ class LiveTradingEngine:
                     return
                 
                 # Re-validate that the regime did not shift during the yield
-                is_mean_reversion_post = (seconds_left > 480.0)
+                is_mean_reversion_post = (seconds_left > 600.0)
                 if is_mean_reversion_post != is_mean_reversion:
                     logger.warning(f"[{asset_symbol}] Regime shift detected during network yield (Mean Reversion was {is_mean_reversion}, now {is_mean_reversion_post}). Aborting trade.")
                     return

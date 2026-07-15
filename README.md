@@ -33,8 +33,8 @@ Waits exclusively for massive directional futures liquidations to capture explos
   * **Bybit**: V5 linear perpetual liquidations (mapping Bybit position side to order direction).
   * **Hyperliquid**: Decentralized perpetual fills (detecting on-chain liquidation sub-objects).
 * **Dual-Regime Time-Window Gates**: Operating under two contiguous, non-overlapping temporal windows across the 15-minute event cycle:
-  * **Early Window (15m to 8m remaining - Mean Reversion Mode)**: Assumes early-stage wicks will pull back. Reverts the trade direction (buys `NO` on short liquidations, `YES` on long liquidations) and applies strict trend shield and Bollinger Band boundaries.
-  * **Golden Window (8m to 1.5m remaining - Momentum Breakout Mode)**: Standard directional sniping (buys `YES` on short liquidations, `NO` on long liquidations) to catch breakout runs.
+  * **Early Window (15m to 10m remaining - Mean Reversion Mode)**: Assumes early-stage wicks will pull back. Reverts the trade direction (buys `NO` on short liquidations, `YES` on long liquidations) and applies strict trend shield and Bollinger Band boundaries.
+  * **Golden Window (10m to 1.5m remaining - Momentum Breakout Mode)**: Standard directional sniping (buys `YES` on short liquidations, `NO` on long liquidations) to catch breakout runs.
 * **Spot-to-Strike Distance Gate**: Restricts entries to Out-of-the-Money (OTM) options only if the spot-to-strike distance is within $1.5 \times \text{Standard Deviation}$ ($\sigma$) derived from Bollinger Bands, dynamically scaling the gate with active market volatility.
 * **Pricing Consistency Gate**: Restricts OTM entries to a maximum purchase price of `$0.55` to prevent buying stale or illiquid markup contracts.
 * **Fallback Ingestion**: If Coinbase ticks are missing (e.g. for `HYPE-USD`), the engine utilizes the Binance/Bybit/Hyperliquid liquidation event price as a spot proxy to feed indicators and safety gates.
