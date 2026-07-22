@@ -1180,7 +1180,7 @@ class LiveTradingEngine:
             if seconds_left < 90.0 or seconds_left > 720.0:
                 return
             
-            is_mean_reversion = (seconds_left > 600.0)
+            is_mean_reversion = (seconds_left > 480.0)
             
             if payload_dict["o"]["S"] == "SELL": 
                 trade_side = "YES" if is_mean_reversion else "NO"
@@ -1254,7 +1254,7 @@ class LiveTradingEngine:
                 if seconds_left < 90.0 or seconds_left > 720.0:
                     return
                 
-                is_mean_reversion_post = (seconds_left > 600.0)
+                is_mean_reversion_post = (seconds_left > 480.0)
                 if is_mean_reversion_post != is_mean_reversion:
                     logger.warning(f"[{asset_symbol}] Regime shift detected during network yield (Mean Reversion was {is_mean_reversion}, now {is_mean_reversion_post}). Aborting trade.")
                     return
