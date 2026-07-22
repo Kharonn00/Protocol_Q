@@ -68,6 +68,8 @@ class BotConfig:
         "DOGE-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_DOGE", "300000.0"))
     })
     MAX_ALLOWED_SPREAD: Decimal = Decimal(os.environ.get("MAX_ALLOWED_SPREAD", "0.18"))
+    MAX_ENTRY_PRICE_YES: Decimal = Decimal(os.environ.get("MAX_ENTRY_PRICE_YES", "0.55"))
+    MAX_ENTRY_PRICE_NO: Decimal = Decimal(os.environ.get("MAX_ENTRY_PRICE_NO", "0.75"))
 
     MIN_EMA_TICKS: int = int(os.environ.get("MIN_EMA_TICKS", "1000"))
     MAX_PRICE_DEVIATION_PCT: float = 0.15      
@@ -105,6 +107,10 @@ class BotConfig:
             raise ValueError(f"LOCKOUT_AFTER_SEC={self.LOCKOUT_AFTER_SEC} out of safe range [0, 7200]")
         if not (Decimal("0.01") <= self.MAX_ALLOWED_SPREAD <= Decimal("0.50")):
             raise ValueError(f"MAX_ALLOWED_SPREAD={self.MAX_ALLOWED_SPREAD} out of safe range [0.01, 0.50]")
+        if not (Decimal("0.10") <= self.MAX_ENTRY_PRICE_YES <= Decimal("0.60")):
+            raise ValueError(f"MAX_ENTRY_PRICE_YES={self.MAX_ENTRY_PRICE_YES} out of safe range [0.10, 0.60]")
+        if not (Decimal("0.10") <= self.MAX_ENTRY_PRICE_NO <= Decimal("0.85")):
+            raise ValueError(f"MAX_ENTRY_PRICE_NO={self.MAX_ENTRY_PRICE_NO} out of safe range [0.10, 0.85]")
         for asset, floor_val in self.STD_DEV_FLOORS_PCT.items():
             if not (0.0 <= floor_val <= 1.0):
                 raise ValueError(f"STD_DEV_FLOORS_PCT[{asset}]={floor_val} out of safe range [0.0, 1.0]")
@@ -2594,8 +2600,8 @@ class LiveTradingEngine:
             if not threshold or notional < threshold: return 
 
             current_time = time.time()
-            seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
-            if seconds_left < 90.0 or seconds_left > 900.0:
+            seconds_left = state.expiration_time - current_time if state.expiration_time else 720.0
+            if seconds_left < 90.0 or seconds_left > 720.0:
                 return
             
             is_mean_reversion = (seconds_left > 600.0)
@@ -2623,14 +2629,14 @@ class LiveTradingEngine:
                     logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Indicator warmup in progress ({state.tick_count}/50 ticks).")
                     return
                 
-                # 1. Macro Trend Shield check (Commented out per user request)
-                # macro = self.macro_trend.get(asset_symbol, "FLAT")
-                # if trade_side == "YES" and macro == "DOWN":
-                #     logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Trade is YES (bullish), but macro trend is DOWN.")
-                #     return
-                # if trade_side == "NO" and macro == "UP":
-                #     logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Trade is NO (bearish), but macro trend is UP.")
-                #     return
+                # 1. Macro Trend Shield (active for mean reversion only — blocks entries that fight the 4H macro trend)
+                macro = self.macro_trend.get(asset_symbol, "FLAT")
+                if trade_side == "YES" and macro == "DOWN":
+                    logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Trade is YES (bullish), but macro trend is DOWN.")
+                    return
+                if trade_side == "NO" and macro == "UP":
+                    logger.info(f"[{asset_symbol}] Early-window mean-reversion blocked: Trade is NO (bearish), but macro trend is UP.")
+                    return
                 
                 # 2. Bollinger Band Volatility Gate check
                 mean, upper, lower = state.fast_indicators.get_bollinger_bands()
@@ -2675,8 +2681,8 @@ class LiveTradingEngine:
                 if self.circuit_breaker.is_locked_out():
                     return
                 current_time = time.time()
-                seconds_left = state.expiration_time - current_time if state.expiration_time else 900.0
-                if seconds_left < 90.0 or seconds_left > 900.0:
+                seconds_left = state.expiration_time - current_time if state.expiration_time else 720.0
+                if seconds_left < 90.0 or seconds_left > 720.0:
                     return
                 
                 # Re-validate that the regime did not shift during the yield
@@ -2689,17 +2695,21 @@ class LiveTradingEngine:
                     return
                     
                 best_bid, best_ask, bid_depth, ask_depth = best_vals
+                if best_ask.is_nan() or best_bid.is_nan():
+                    logger.warning(f"[{asset_symbol}] Orderbook rejected: NaN price detected in quotes (Bid: {best_bid}, Ask: {best_ask}).")
+                    return
                 spread = best_ask - best_bid
                 
                 # Dynamic spread limit based on bid price
                 max_spread = min(config.MAX_ALLOWED_SPREAD, max(Decimal("0.05"), best_bid * Decimal("0.30")))
-                if best_ask >= Decimal("0.85") or best_bid < Decimal("0.01") or best_ask < Decimal("0.15") or spread > max_spread:
-                    logger.debug(f"[{asset_symbol}] Silent drop: Orderbook rejected (Bid: ${best_bid}, Ask: ${best_ask}, Spread: ${spread}, MaxSpread: ${max_spread}).")
+                max_entry_price = config.MAX_ENTRY_PRICE_YES if trade_side == "YES" else config.MAX_ENTRY_PRICE_NO
+                if best_ask > max_entry_price or best_bid < Decimal("0.01") or best_ask < Decimal("0.15") or spread > max_spread:
+                    logger.warning(f"[{asset_symbol}] Orderbook rejected: Ask ${best_ask:.2f} exceeds {trade_side} MAX_ENTRY_PRICE (${max_entry_price:.2f}) or bad orderbook (Bid: ${best_bid}, Spread: ${spread}, MaxSpread: ${max_spread}).")
                     return
                     
                 limit_price = max(Decimal("0.01"), min(Decimal("0.99"), best_ask))
                 
-                # === SPOT-TO-STRIKE DISTANCE & PRICING CONSISTENCY GATES ===
+                # === SPOT-TO-STRIKE DISTANCE GATES ===
                 if state.strike_price and state.last_price:
                     spot_price = Decimal(str(state.last_price))
                     strike_price = Decimal(str(state.strike_price))
@@ -2715,25 +2725,17 @@ class LiveTradingEngine:
                         # YES is OTM if spot < strike
                         if spot_price < strike_price:
                             distance = strike_price - spot_price
-                            # 1. Distance Gate: Block if spot is more than 1.5 standard deviations OTM (Momentum breakout only)
+                            # Distance Gate: Block if spot is more than 1.5 standard deviations OTM (Momentum breakout only)
                             if not is_mean_reversion_post and distance > Decimal("1.5") * std_dev_dec:
                                 logger.info(f"[{asset_symbol}] Drop: YES trade blocked. Spot ${spot_price} is too far below Strike ${strike_price} (Dist: {distance:.2f} > 1.5 * StdDev: {Decimal('1.5') * std_dev_dec:.2f}).")
-                                return
-                            # 2. Pricing Consistency Gate: Block if OTM option is overpriced (Lagging quote / wide spread markup)
-                            if limit_price > Decimal("0.55"):
-                                logger.warning(f"[{asset_symbol}] Drop: Overpriced OTM YES trade blocked. Spot ${spot_price} < Strike ${strike_price}, but Limit Price is ${limit_price} (> $0.55).")
                                 return
                     elif trade_side == "NO":
                         # NO is OTM if spot > strike
                         if spot_price > strike_price:
                             distance = spot_price - strike_price
-                            # 1. Distance Gate: Block if spot is more than 1.5 standard deviations OTM (Momentum breakout only)
+                            # Distance Gate: Block if spot is more than 1.5 standard deviations OTM (Momentum breakout only)
                             if not is_mean_reversion_post and distance > Decimal("1.5") * std_dev_dec:
                                 logger.info(f"[{asset_symbol}] Drop: NO trade blocked. Spot ${spot_price} is too far above Strike ${strike_price} (Dist: {distance:.2f} > 1.5 * StdDev: {Decimal('1.5') * std_dev_dec:.2f}).")
-                                return
-                            # 2. Pricing Consistency Gate: Block if OTM option is overpriced (Lagging quote / wide spread markup)
-                            if limit_price > Decimal("0.55"):
-                                logger.warning(f"[{asset_symbol}] Drop: Overpriced OTM NO trade blocked. Spot ${spot_price} > Strike ${strike_price}, but Limit Price is ${limit_price} (> $0.55).")
                                 return
                 
                 should_decrement = False
