@@ -7,9 +7,16 @@ Currently deployed as an optimized, multi-stage AWS ECS Fargate service, the dae
 
 ---
 
-## 🏛️ System Architecture
+## 🏛️ System Architecture & Package Structure
 
 * **Runtime Environment:** Python 3.12-slim and Rust (ABI-aligned multi-stage compilation).
+* **Package Modularization (`engine/` Package):**
+  * `engine/config.py`: Centralized `BotConfig`, default `config` instance, `GLOBAL_SSL_CONTEXT`, `TRUSTED_INTERNAL_HOSTS` whitelist, and precompiled regexes (`DOLLAR_STRIKE_RE`, `GENERIC_NUMBER_RE`, `_ANSI_ESCAPE_RE`).
+  * `engine/models.py`: `AssetState`, `PerformanceTracker`, zero-trust Pydantic schema validation (`EconomicEvent`, `EconomicCalendarResponse`), type-safe financial parsers (`safe_decimal`, `safe_int`), fast ticker validators (`validate_tick_data`, `validate_binance_payload`), and a fallback `PyFastIndicators` handler for environments where the Rust FFI extension is absent.
+  * `engine/security.py`: `SafeResolver` (SSRF & DNS rebinding defense), `MacroCircuitBreaker`, `sanitize_log_str` (CWE-117 log injection and ANSI escape defense), `is_private_ip`, `safe_drain_queue`, `calculate_backoff_delay`, `handle_health_check`, and `log_exception_group`.
+  * `engine/broker.py`: `ExecutionBroker` abstract base class, `SimExecutionBroker`, `LiveKalshiBroker`, RSA-PSS V2 protocol request signing, REST API methods, paper trading orderbook matching engine (`_paper_orders` with atomic lock protection), and `_extract_fill_price` helper.
+  * `engine/strategy.py`: Core `LiveTradingEngine`, Binance Liquidation Sniper, laddered Take-Profit lifecycle monitor, settlement reconciliation loops, multi-venue WebSocket ingestion consumers (Coinbase, Binance, Bybit, Hyperliquid, Kalshi Private), and `get_kalshi_credentials` (AWS Secrets Manager zero-residency PEM loader).
+  * `kalshi_main.py`: Lightweight 100-line entry point bootstrapper script that instantiates `LiveTradingEngine` and manages the asyncio event loop.
 * **Rust PyO3 Extension:** Native compiled `kalshi_bot` library provides `FastIndicators` for ultra-low latency, GIL-free technical calculations (Bollinger Bands, EMA, RSI, and running Z-Scores).
 * **Orchestration:** AWS Elastic Container Service (ECS) with Fargate (`readonlyRootFilesystem: true`).
 * **State Management:** Fully stateless, ephemeral execution engine (Twelve-Factor App Compliant).
@@ -32,13 +39,17 @@ Waits exclusively for massive directional futures liquidations to capture explos
   * **Binance**: USDS-M perpetual liquidations.
   * **Bybit**: V5 linear perpetual liquidations (mapping Bybit position side to order direction).
   * **Hyperliquid**: Decentralized perpetual fills (detecting on-chain liquidation sub-objects).
-* **Dual-Regime Time-Window Gates**: Operating under two contiguous, non-overlapping temporal windows across the 15-minute event cycle:
-  * **Early Window (15m to 10m remaining - Mean Reversion Mode)**: Assumes early-stage wicks will pull back. Reverts the trade direction (buys `NO` on short liquidations, `YES` on long liquidations) and applies strict trend shield and Bollinger Band boundaries.
-  * **Golden Window (10m to 1.5m remaining - Momentum Breakout Mode)**: Standard directional sniping (buys `YES` on short liquidations, `NO` on long liquidations) to catch breakout runs.
+* **Dual-Regime Time-Window Gates**: Operating under strict temporal windows across the 15-minute event cycle:
+  * **Ignored Window (Minutes 0.0 to 3.0 / `seconds_left > 720.0s`)**: No trades allowed (blocks early-event wick traps before strike price equilibrium forms).
+  * **Early Window (Minutes 3.0 to 7.0 / `480.0s < seconds_left <= 720.0s` - Mean Reversion Mode)**: Assumes early-stage wicks will pull back. Reverts trade direction (buys `NO` on short liquidations, `YES` on long liquidations) and applies strict 4H Macro Trend Shield and Bollinger Band boundaries.
+  * **Golden Window (Minutes 7.0 to 13.5 / `90.0s <= seconds_left <= 480.0s` - Momentum Breakout Mode)**: Standard directional sniping (buys `YES` on short liquidations, `NO` on long liquidations) to catch momentum breakout runs.
+  * **Ignored Window (Minutes 13.5 to 15.0 / `seconds_left < 90.0s`)**: No trades allowed (prevents last-second expiration slippage).
+* **Decoupled Directional Price Caps**:
+  * **`MAX_ENTRY_PRICE_YES` (`$0.55`)**: Prevents buying overpriced `YES` momentum tops (historically 0% win rate when buying `YES` above $0.60).
+  * **`MAX_ENTRY_PRICE_NO` (`$0.75`)**: Preserves high-probability 70-75% `NO` mean-reversion entries while blocking negative-EV $0.80+ outliers.
 * **Spot-to-Strike Distance Gate**: Restricts entries to Out-of-the-Money (OTM) options only if the spot-to-strike distance is within $1.5 \times \text{Standard Deviation}$ ($\sigma$) derived from Bollinger Bands, dynamically scaling the gate with active market volatility.
-* **Pricing Consistency Gate**: Restricts OTM entries to a maximum purchase price of `$0.55` to prevent buying stale or illiquid markup contracts.
 * **Fallback Ingestion**: If Coinbase ticks are missing (e.g. for `HYPE-USD`), the engine utilizes the Binance/Bybit/Hyperliquid liquidation event price as a spot proxy to feed indicators and safety gates.
-* **Asset Performance Auto-Throttle**: Queries [PerformanceTracker](kalshi_main.py#L278) to throttle trades dynamically if the rolling outcome history (last 20 trades per asset/hour in a `deque`) yields a win rate $\le 35\%$ over at least 5 samples.
+* **Asset Performance Auto-Throttle**: Queries `PerformanceTracker` in `engine/models.py` to throttle trades dynamically if the rolling outcome history (last 20 trades per asset/hour in a `deque`) yields a win rate $\le 35\%$ over at least 5 samples.
 
 ### 2. Z-Score Momentum Breakout / Mean Reversion Sniper - [DEACTIVATED]
 * *Status*: Commented out / disabled to prioritize liquidation breakout edge.
@@ -69,12 +80,12 @@ Fundamentally prevents the bot from trading during exogenous regime shifts.
 ## 🔒 Security Posture & Zero-Trust Architecture
 
 The system is engineered assuming a strictly hostile network and execution environment:
-* **WebSockets SSRF/DNS Rebinding Defense**: All incoming WS connections check target URLs against [is_safe_destination_async](kalshi_main.py#L387) pre-flight to prevent connections resolving to private loopback or internal metadata space. Applies to Coinbase, Binance, Bybit, and Hyperliquid client handshakes.
+* **WebSockets SSRF/DNS Rebinding Defense**: All incoming WS connections check target URLs against `is_safe_destination_async` in `engine/security.py` pre-flight to prevent connections resolving to private loopback or internal metadata space. Applies to Coinbase, Binance, Bybit, and Hyperliquid client handshakes.
 * **HTTP Redirect SSRF Prevention**: Forces `allow_redirects=False` on all external HTTP requests inside candle synchronization loops to prevent attackers from bypassing DNS resolver gates via HTTP 3xx redirects to local metadata.
 * **Trusted Proxy Client IP Resolution**: Health endpoint resolves `X-Forwarded-For` from right to left (to prevent header spoofing) strictly if the immediate connecting IP belongs to a private network (e.g. AWS ALB). Direct connections fallback to the socket IP.
 * **Health Check Rate Limiting**: Employs a per-source-IP sliding window rate limiter on the health server, with sliding eviction rather than full resets to prevent cache poisoning, and loopback/private connection bypasses.
-* **Locked Capital Telemetry Filtering**: [get_locked_capital](kalshi_main.py#L828) aggregates only resting orders with `action == "buy"`, preventing resting sell/TP orders from inflating telemetry logs.
-* **Paper Trading Lock Boundaries**: Employs a dedicated `paper_orders_lock` within [LiveKalshiBroker](kalshi_main.py#L744) to guarantee thread-safe mutations of paper balance and paper order logs across async yields.
+* **Locked Capital Telemetry Filtering**: `get_locked_capital` in `engine/broker.py` aggregates only resting orders with `action == "buy"`, preventing resting sell/TP orders from inflating telemetry logs.
+* **Paper Trading Lock Boundaries**: Employs a dedicated `paper_orders_lock` within `LiveKalshiBroker` in `engine/broker.py` to guarantee thread-safe mutations of paper balance and paper order logs across async yields.
 * **Shielded Task Cancellation Cleanups (Zero-Leak Execution)**: Cleanup routines (order cancellation and final balance/position reconciliation) are wrapped in background coroutines shielded via `_safe_shield`, ensuring they execute to completion in the event loop even if the parent task is aborted or timed out.
 * **Double-Checked Locking (DCL) Concurrency Shield**: Checks position bounds locklessly, yields to retrieve market prices, and then validates state inside a synchronous `balance_lock` to stop duplicate execution races.
 * **Heap Memory Cryptographic Hardening**: Overwrites immutable string dictionary entries (`SecretString`, `PRIVATE_KEY`, `KEY_ID`) inside Secrets Manager decoding, zeroes mutable `bytearray` buffers with `ctypes.memset`, and performs double `gc.collect()` passes on shutdown to eliminate OpenSSL key residency.
