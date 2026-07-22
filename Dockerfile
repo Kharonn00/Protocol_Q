@@ -50,6 +50,7 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 COPY kalshi_main.py .
+COPY engine/ ./engine/
 
 # SECURITY: Create non-root user and grant explicit ownership of the working directory
 RUN useradd -m botuser && chown -R botuser:botuser /app
