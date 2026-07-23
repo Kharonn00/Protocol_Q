@@ -159,7 +159,7 @@ class LiveKalshiBroker(ExecutionBroker):
 
     async def start(self):
         resolver = SafeResolver()
-        connector = aiohttp.TCPConnector(ssl=GLOBAL_SSL_CONTEXT, resolver=resolver)
+        connector = aiohttp.TCPConnector(ssl=GLOBAL_SSL_CONTEXT, resolver=resolver, ttl_dns_cache=300, limit=100)
         self.session = aiohttp.ClientSession(connector=connector)
 
     async def close(self):
