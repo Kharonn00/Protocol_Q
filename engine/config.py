@@ -25,7 +25,11 @@ class BotConfig:
     })
     MAX_ALLOWED_SPREAD: Decimal = Decimal(os.environ.get("MAX_ALLOWED_SPREAD", "0.18"))
     MAX_ENTRY_PRICE_YES: Decimal = Decimal(os.environ.get("MAX_ENTRY_PRICE_YES", "0.55"))
-    MAX_ENTRY_PRICE_NO: Decimal = Decimal(os.environ.get("MAX_ENTRY_PRICE_NO", "0.75"))
+    MAX_ENTRY_PRICE_NO: Decimal = Decimal(os.environ.get("MAX_ENTRY_PRICE_NO", "0.65"))
+
+    # Paper trading cost parameters
+    PAPER_SLIPPAGE: Decimal = Decimal(os.environ.get("PAPER_SLIPPAGE", "0.01"))
+    PAPER_TAKER_FEE: Decimal = Decimal(os.environ.get("PAPER_TAKER_FEE", "0.005"))
 
     MIN_EMA_TICKS: int = int(os.environ.get("MIN_EMA_TICKS", "1000"))
     MAX_PRICE_DEVIATION_PCT: float = 0.15      
@@ -75,8 +79,12 @@ class BotConfig:
             raise ValueError(f"MAX_ALLOWED_SPREAD={self.MAX_ALLOWED_SPREAD} out of safe range [0.01, 0.50]")
         if not (Decimal("0.10") <= self.MAX_ENTRY_PRICE_YES <= Decimal("0.60")):
             raise ValueError(f"MAX_ENTRY_PRICE_YES={self.MAX_ENTRY_PRICE_YES} out of safe range [0.10, 0.60]")
-        if not (Decimal("0.10") <= self.MAX_ENTRY_PRICE_NO <= Decimal("0.85")):
-            raise ValueError(f"MAX_ENTRY_PRICE_NO={self.MAX_ENTRY_PRICE_NO} out of safe range [0.10, 0.85]")
+        if not (Decimal("0.10") <= self.MAX_ENTRY_PRICE_NO <= Decimal("0.75")):
+            raise ValueError(f"MAX_ENTRY_PRICE_NO={self.MAX_ENTRY_PRICE_NO} out of safe range [0.10, 0.75]")
+        if not (Decimal("0.00") <= self.PAPER_SLIPPAGE <= Decimal("0.05")):
+            raise ValueError(f"PAPER_SLIPPAGE={self.PAPER_SLIPPAGE} out of safe range [0.00, 0.05]")
+        if not (Decimal("0.00") <= self.PAPER_TAKER_FEE <= Decimal("0.02")):
+            raise ValueError(f"PAPER_TAKER_FEE={self.PAPER_TAKER_FEE} out of safe range [0.00, 0.02]")
         if not (Decimal("0.0001") <= self.INDEX_LAG_MIN_DIVERGENCE <= Decimal("0.05")):
             raise ValueError(f"INDEX_LAG_MIN_DIVERGENCE={self.INDEX_LAG_MIN_DIVERGENCE} out of safe range [0.0001, 0.05]")
         if not (Decimal("1.5") <= self.OFI_BUY_SELL_RATIO <= Decimal("20.0")):

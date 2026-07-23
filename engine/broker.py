@@ -541,21 +541,31 @@ class LiveKalshiBroker(ExecutionBroker):
                     if action == "buy" and best_ask <= limit_price:
                         new_fills = min(remaining, ask_depth)
                         if new_fills > 0:
+                            slippage = Decimal(str(getattr(config, "PAPER_SLIPPAGE", "0.01")))
+                            fee_rate = Decimal(str(getattr(config, "PAPER_TAKER_FEE", "0.005")))
+                            slippage_price = min(Decimal("0.99"), best_ask + slippage)
+                            actual_cost = Decimal(new_fills) * slippage_price + Decimal(new_fills) * fee_rate
+                            
                             order_data["filled_quantity"] += new_fills
-                            order_data["total_cost"] += Decimal(new_fills) * best_ask
-                            self._paper_balance += (limit_price - best_ask) * Decimal(new_fills)
+                            order_data["total_cost"] += actual_cost
+                            self._paper_balance += (limit_price * Decimal(new_fills)) - actual_cost
                             if cached_best_vals is not None:
                                 cached_best_vals[3] = max(0, cached_best_vals[3] - new_fills)
-                            logger.warning(f"[PAPER BROKER PARTIAL] BUY fill: {new_fills}x {contract_id} '{side.upper()}' @ ${best_ask:.2f} (Total: {order_data['filled_quantity']}/{quantity})")
+                            logger.warning(f"[PAPER BROKER PARTIAL] BUY fill: {new_fills}x {contract_id} '{side.upper()}' @ ${slippage_price:.2f} (Total: {order_data['filled_quantity']}/{quantity}, Fee: ${Decimal(new_fills)*fee_rate:.4f})")
                     elif action == "sell" and best_bid >= limit_price:
                         new_fills = min(remaining, bid_depth)
                         if new_fills > 0:
+                            slippage = Decimal(str(getattr(config, "PAPER_SLIPPAGE", "0.01")))
+                            fee_rate = Decimal(str(getattr(config, "PAPER_TAKER_FEE", "0.005")))
+                            slippage_price = max(Decimal("0.01"), best_bid - slippage)
+                            actual_proceeds = Decimal(new_fills) * slippage_price - Decimal(new_fills) * fee_rate
+                            
                             order_data["filled_quantity"] += new_fills
-                            order_data["total_cost"] += Decimal(new_fills) * best_bid
+                            order_data["total_cost"] += actual_proceeds
                             if cached_best_vals is not None:
                                 cached_best_vals[2] = max(0, cached_best_vals[2] - new_fills)
-                            self._paper_balance += best_bid * Decimal(new_fills)
-                            logger.warning(f"[PAPER BROKER PARTIAL] SELL fill: {new_fills}x {contract_id} '{side.upper()}' @ ${best_bid:.2f} (Total: {order_data['filled_quantity']}/{quantity})")
+                            self._paper_balance += actual_proceeds
+                            logger.warning(f"[PAPER BROKER PARTIAL] SELL fill: {new_fills}x {contract_id} '{side.upper()}' @ ${slippage_price:.2f} (Total: {order_data['filled_quantity']}/{quantity}, Fee: ${Decimal(new_fills)*fee_rate:.4f})")
                     
                     if quantity <= 0:
                         order_data["status"] = "executed"

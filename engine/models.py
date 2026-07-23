@@ -41,6 +41,7 @@ except ImportError:
         def __init__(self, window_sec: float = 30.0): pass
         def add_trade(self, ts: float, vol: float, is_buy: bool): pass
         def get_metrics(self) -> Tuple[float, float, float]: return 0.0, 0.0, 1.0
+        def update_and_check_persistence(self, timestamp: float, target_ratio: float, min_vol: float, persistence_sec: float) -> Tuple[str, int, bool]: return "", 0, False
 
     class DummyKalshiBotModule:
         FastIndicators = PyFastIndicators

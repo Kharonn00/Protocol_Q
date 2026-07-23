@@ -242,6 +242,9 @@ pub struct TakerOrderFlowTracker {
     total_buy_vol: f64,
     total_sell_vol: f64,
     window_sec: f64,
+    last_ofi_side: String,
+    ofi_persistence_count: i32,
+    last_ofi_check_time: f64,
 }
 
 #[pymethods]
@@ -253,6 +256,9 @@ impl TakerOrderFlowTracker {
             total_buy_vol: 0.0,
             total_sell_vol: 0.0,
             window_sec: window_sec.unwrap_or(30.0),
+            last_ofi_side: "".to_string(),
+            ofi_persistence_count: 0,
+            last_ofi_check_time: 0.0,
         }
     }
 
@@ -317,6 +323,63 @@ impl TakerOrderFlowTracker {
             1.0
         };
         (buy, sell, ratio)
+    }
+
+    /// O(1) signal persistence evaluation running inside Rust
+    pub fn update_and_check_persistence(
+        &mut self,
+        timestamp: f64,
+        target_ratio: f64,
+        min_vol: f64,
+        persistence_sec: f64,
+    ) -> (String, i32, bool) {
+        let buy = self.total_buy_vol;
+        let sell = self.total_sell_vol;
+        let total = buy + sell;
+        
+        if total < min_vol {
+            self.ofi_persistence_count = 0;
+            self.last_ofi_side = "".to_string();
+            return ("".to_string(), 0, false);
+        }
+        
+        let ratio = if sell > 0.0 {
+            buy / sell
+        } else if buy > 0.0 {
+            100.0
+        } else {
+            1.0
+        };
+        
+        let mut current_side = "".to_string();
+        if ratio >= target_ratio {
+            current_side = "YES".to_string();
+        } else if buy > 0.0 && (sell / buy) >= target_ratio {
+            current_side = "NO".to_string();
+        } else if buy == 0.0 && sell > 0.0 {
+            current_side = "NO".to_string();
+        }
+        
+        if current_side.is_empty() {
+            self.ofi_persistence_count = 0;
+            self.last_ofi_side = "".to_string();
+            return ("".to_string(), 0, false);
+        }
+        
+        let mut is_new_candidate = false;
+        if current_side == self.last_ofi_side {
+            if timestamp - self.last_ofi_check_time >= persistence_sec {
+                self.ofi_persistence_count += 1;
+                self.last_ofi_check_time = timestamp;
+            }
+        } else {
+            self.last_ofi_side = current_side.clone();
+            self.ofi_persistence_count = 1;
+            self.last_ofi_check_time = timestamp;
+            is_new_candidate = true;
+        }
+        
+        (self.last_ofi_side.clone(), self.ofi_persistence_count, is_new_candidate)
     }
 
     pub fn len(&self) -> usize {

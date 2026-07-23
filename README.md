@@ -46,7 +46,7 @@ Waits exclusively for massive directional futures liquidations to capture explos
   * **Ignored Window (Minutes 13.5 to 15.0 / `seconds_left < 90.0s`)**: No trades allowed (prevents last-second expiration slippage).
 * **Decoupled Directional Price Caps**:
   * **`MAX_ENTRY_PRICE_YES` (`$0.55`)**: Prevents buying overpriced `YES` momentum tops (historically 0% win rate when buying `YES` above $0.60).
-  * **`MAX_ENTRY_PRICE_NO` (`$0.75`)**: Preserves high-probability 70-75% `NO` mean-reversion entries while blocking negative-EV $0.80+ outliers.
+  * **`MAX_ENTRY_PRICE_NO` (`$0.65`)**: Preserves high-probability `NO` mean-reversion entries while blocking negative-EV $0.70+ outliers.
 * **Spot-to-Strike Distance Gate**: Restricts entries to Out-of-the-Money (OTM) options only if the spot-to-strike distance is within $1.5 \times \text{Standard Deviation}$ ($\sigma$) derived from Bollinger Bands, dynamically scaling the gate with active market volatility.
 * **Fallback Ingestion**: If Coinbase ticks are missing (e.g. for `HYPE-USD`), the engine utilizes the Binance/Bybit/Hyperliquid liquidation event price as a spot proxy to feed indicators and safety gates.
 * **Asset Performance Auto-Throttle**: Queries `PerformanceTracker` in `engine/models.py` to throttle trades dynamically if the rolling outcome history (last 20 trades per asset/hour in a `deque`) yields a win rate $\le 35\%$ over at least 5 samples.
@@ -60,12 +60,12 @@ Waits exclusively for massive directional futures liquidations to capture explos
 ### 4. CF Benchmarks Index Lag Arbitrage - [ACTIVE]
 Exploits the 60-second rolling average calculation lag of the settlement index during sudden price surges.
 * **Mechanism**: Rust `IndexLagTracker` maintains an $O(1)$ ring buffer tracking spot prices over 60 seconds. When spot price diverges from the 60s moving average by more than `INDEX_LAG_MIN_DIVERGENCE` (0.12%), a directional signal fires.
-* **Risk Controls**: Operates strictly within the Golden Window (1.5 to 8.0 minutes remaining) and enforces standard price caps (`MAX_ENTRY_PRICE_YES` $\le \$0.55$, `MAX_ENTRY_PRICE_NO` $\le \$0.75$).
+* **Risk Controls**: Operates strictly within the Golden Window (1.5 to 8.0 minutes remaining) and enforces standard price caps (`MAX_ENTRY_PRICE_YES` $\le \$0.55$, `NO` $\le \$0.65$).
 
 ### 5. Taker Order Flow Imbalance (OFI) - [ACTIVE]
 Tracks completed cash-register taker trades (`match` events) to capture institutional order flow momentum.
 * **Zero-L2 Policy**: Strictly ignores resting limit orders, making the strategy 100% immune to L2 orderbook spoofing.
-* **Mechanism**: Rust `TakerOrderFlowTracker` maintains an $O(1)$ 30-second trade tape volume buffer. Fires when Taker Buy/Sell volume ratio exceeds `OFI_BUY_SELL_RATIO` (3.5x) on minimum notional volume `OFI_MIN_VOLUME_NOTIONAL` ($50,000).
+* **Mechanism**: Rust `TakerOrderFlowTracker` maintains an $O(1)$ 30-second trade tape volume buffer and natively evaluates signal persistence to eliminate Python event loop timing delays, using an exact side-transition flag to suppress log spam. Fires when Taker Buy/Sell volume ratio exceeds `OFI_BUY_SELL_RATIO` (3.5x) on minimum notional volume `OFI_MIN_VOLUME_NOTIONAL` ($50,000).
 
 ### 6. Macroeconomic Circuit Breaker (The Steamroller Defense) - [ACTIVE]
 Fundamentally prevents the bot from trading during exogenous regime shifts.
@@ -97,9 +97,9 @@ The system is engineered assuming a strictly hostile network and execution envir
 * **Trusted Proxy Client IP Resolution**: Health endpoint resolves `X-Forwarded-For` from right to left (to prevent header spoofing) strictly if the immediate connecting IP belongs to a private network (e.g. AWS ALB). Direct connections fallback to the socket IP.
 * **Health Check Rate Limiting**: Employs a per-source-IP sliding window rate limiter on the health server, with sliding eviction rather than full resets to prevent cache poisoning, and loopback/private connection bypasses.
 * **Locked Capital Telemetry Filtering**: `get_locked_capital` in `engine/broker.py` aggregates only resting orders with `action == "buy"`, preventing resting sell/TP orders from inflating telemetry logs.
-* **Paper Trading Lock Boundaries**: Employs a dedicated `paper_orders_lock` within `LiveKalshiBroker` in `engine/broker.py` to guarantee thread-safe mutations of paper balance and paper order logs across async yields.
+* **Paper Trading Lock Boundaries**: Employs a dedicated `paper_orders_lock` within `LiveKalshiBroker` in `engine/broker.py` to guarantee thread-safe mutations of paper balance and paper order logs across async yields. Includes a simulated cost model applying $0.01 slippage and $0.005 exchange transaction fees per contract on paper-traded fills.
 * **Shielded Task Cancellation Cleanups (Zero-Leak Execution)**: Cleanup routines (order cancellation and final balance/position reconciliation) are wrapped in background coroutines shielded via `_safe_shield`, ensuring they execute to completion in the event loop even if the parent task is aborted or timed out.
-* **Double-Checked Locking (DCL) Concurrency Shield**: Checks position bounds locklessly, yields to retrieve market prices, and then validates state inside a synchronous `balance_lock` via extracted helpers (`_validate_orderbook_entry`, `_acquire_execution_slot`) to stop duplicate execution races.
+* **Double-Checked Locking (DCL) Concurrency Shield**: Checks position bounds locklessly, yields to retrieve market prices, and then validates state inside a synchronous `balance_lock` via extracted helpers (`_validate_orderbook_entry`, `_acquire_execution_slot`) to stop duplicate execution races. Hardened with an atomic `execution_in_flight` set check. If a contract is already active in-flight, subsequent execution tasks exit immediately with **0s lockout** and zero REST API overhead, eliminating race conditions (TOCTOU) and preventing API request storming.
 * **Heap Memory Cryptographic Hardening**: Overwrites immutable string dictionary entries (`SecretString`, `PRIVATE_KEY`, `KEY_ID`) inside Secrets Manager decoding, zeroes mutable `bytearray` buffers with `ctypes.memset`, clears bootstrapper credential variables in `kalshi_main.py`, and performs double `gc.collect()` passes on shutdown to eliminate OpenSSL key residency.
 * **Rust FFI Queue Capacity Bounding (SEV-1 Mitigation)**: Implements hard 5,000-element capacity caps on Rust `IndexLagTracker` and `TakerOrderFlowTracker` ring buffers to prevent out-of-memory (OOM) heap exhaustion under tick floods, adding periodic sum recalculations to eliminate floating-point accumulation drift.
 * **Active Cooldown Guards & Rate Limit Lockout**: Freezes order routing and snipes for **60 seconds** across the entire bot if any API endpoint receives an HTTP 429 response, short-circuiting REST requests early to avoid API bans.

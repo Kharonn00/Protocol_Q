@@ -56,6 +56,7 @@ class LiveTradingEngine:
         self._last_drop_log_time: float = 0.0
         
         self.active_trade_count: int = 0
+        self.execution_in_flight: Set[str] = set()
         self._binance_events_received: int = 0 
         self.shutting_down: bool = False
         self.engine_start_time: float = time.time()
@@ -157,9 +158,11 @@ class LiveTradingEngine:
         task.add_done_callback(self._handle_task_done)
         return await asyncio.shield(task)
 
-    async def _decrement_trade_cap(self):
+    async def _decrement_trade_cap(self, contract_id: Optional[str] = None):
         async with self.trade_cap_lock:
             self.active_trade_count = max(0, self.active_trade_count - 1)
+            if contract_id:
+                self.execution_in_flight.discard(contract_id)
 
     def _handle_task_done(self, task: asyncio.Task):
         """Single callback method to clear tracked task references."""
@@ -1215,7 +1218,7 @@ class LiveTradingEngine:
                     await self._safe_shield(release_locked_capital(locked_capital, -quantity))
             raise
         finally:
-            await self._safe_shield(self._decrement_trade_cap())
+            await self._safe_shield(self._decrement_trade_cap(contract_id))
 
     # ==========================================
     # CORE QUANTITATIVE ENGINE: Mean-Reversion
@@ -1405,7 +1408,9 @@ class LiveTradingEngine:
             try:
                 async with self.trade_cap_lock:
                     if self.active_trade_count >= config.MAX_CONCURRENT_TRADES: return
+                    if executing_contract_id in self.execution_in_flight: return
                     self.active_trade_count += 1
+                    self.execution_in_flight.add(executing_contract_id)
                     slot_acquired = True
                 best_vals = await self.broker.get_best_bid_ask(executing_contract_id, trade_side)
                 if not best_vals:
@@ -1460,7 +1465,7 @@ class LiveTradingEngine:
                 raise
             finally:
                 if slot_acquired:
-                    await self._safe_shield(self._decrement_trade_cap())
+                    await self._safe_shield(self._decrement_trade_cap(executing_contract_id))
                 
         except Exception as e:
             logger.error("Liquidation processing fault", exc_info=True) 
@@ -1518,40 +1523,27 @@ class LiveTradingEngine:
         if not self.performance_tracker.should_trade(asset_symbol, current_hour):
             return
 
-        buy_vol, sell_vol, ratio = state.taker_ofi_tracker.get_metrics()
-        total_vol = buy_vol + sell_vol
-        min_vol = float(config.OFI_MIN_VOLUME_NOTIONAL)
         target_ratio = float(config.OFI_BUY_SELL_RATIO)
+        min_vol = float(config.OFI_MIN_VOLUME_NOTIONAL)
 
-        if total_vol < min_vol:
-            return
-
-        trade_side = None
-        if ratio >= target_ratio:
-            trade_side = "YES"
-        elif sell_vol > 0.0 and (sell_vol / max(buy_vol, 1.0)) >= target_ratio:
-            trade_side = "NO"
+        trade_side, persistence_count, is_new_candidate = state.taker_ofi_tracker.update_and_check_persistence(
+            current_time, target_ratio, min_vol, 2.5
+        )
 
         if not trade_side:
-            state.ofi_persistence_count = 0
-            state.last_ofi_side = ""
             return
 
-        if trade_side == getattr(state, "last_ofi_side", ""):
-            if current_time - getattr(state, "last_ofi_check_time", 0.0) >= 2.5:
-                state.ofi_persistence_count += 1
-                state.last_ofi_check_time = current_time
-        else:
-            state.last_ofi_side = trade_side
-            state.ofi_persistence_count = 1
-            state.last_ofi_check_time = current_time
+        buy_vol, sell_vol, ratio = state.taker_ofi_tracker.get_metrics()
 
-        if state.ofi_persistence_count < 2:
-            logger.info(f"[{asset_symbol}] TAKER OFI CANDIDATE! ({trade_side} | Ratio: {ratio:.2f}x) Persistence: {state.ofi_persistence_count}/2. Awaiting 2.5s confirmation...")
+        if persistence_count == 1:
+            if is_new_candidate:
+                logger.info(f"[{asset_symbol}] TAKER OFI CANDIDATE! ({trade_side} | Ratio: {ratio:.2f}x) Persistence: {persistence_count}/2. Awaiting 2.5s confirmation...")
+            return
+        elif persistence_count < 2:
             return
 
         state.last_signal_time = current_time
-        logger.info(f"[{asset_symbol}] 🎯 CONFIRMED TAKER OFI SIGNAL (2/2 Persistence)! 30s BuyVol: ${buy_vol:,.0f} | SellVol: ${sell_vol:,.0f} | Ratio: {ratio:.2f}x | Side: {trade_side}")
+        logger.warning(f"[{asset_symbol}] 🎯 CONFIRMED TAKER OFI SIGNAL (2/2 Persistence)! 30s BuyVol: ${buy_vol:,.0f} | SellVol: ${sell_vol:,.0f} | Ratio: {ratio:.2f}x | Side: {trade_side}")
         await self._route_generic_signal_entry(asset_symbol, state, trade_side, f"TAKER_OFI ({ratio:.1f}x)", current_time, seconds_left)
 
     # ==========================================
@@ -1571,7 +1563,10 @@ class LiveTradingEngine:
             async with self.trade_cap_lock:
                 if self.active_trade_count >= config.MAX_CONCURRENT_TRADES:
                     return
+                if executing_contract_id in self.execution_in_flight:
+                    return
                 self.active_trade_count += 1
+                self.execution_in_flight.add(executing_contract_id)
                 slot_acquired = True
 
             best_vals = await self.broker.get_best_bid_ask(executing_contract_id, trade_side)
@@ -1625,7 +1620,7 @@ class LiveTradingEngine:
             raise
         finally:
             if slot_acquired:
-                await self._safe_shield(self._decrement_trade_cap()) 
+                await self._safe_shield(self._decrement_trade_cap(executing_contract_id)) 
 
 # ==========================================
 # ASYNC QUEUES
