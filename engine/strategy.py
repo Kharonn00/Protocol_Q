@@ -1270,8 +1270,21 @@ class LiveTradingEngine:
                 
                 max_spread = min(config.MAX_ALLOWED_SPREAD, max(Decimal("0.05"), best_bid * Decimal("0.30")))
                 max_entry_price = config.MAX_ENTRY_PRICE_YES if trade_side == "YES" else config.MAX_ENTRY_PRICE_NO
-                if best_ask > max_entry_price or best_bid < Decimal("0.01") or best_ask < Decimal("0.15") or spread > max_spread:
-                    logger.warning(f"[{asset_symbol}] Orderbook rejected: Ask ${best_ask:.2f} exceeds {trade_side} MAX_ENTRY_PRICE (${max_entry_price:.2f}) or bad orderbook (Bid: ${best_bid}, Spread: ${spread}, MaxSpread: ${max_spread}).")
+                
+                rejection_reason = None
+                if best_ask > max_entry_price:
+                    rejection_reason = f"Ask ${best_ask:.2f} exceeds {trade_side} MAX_ENTRY_PRICE (${max_entry_price:.2f})"
+                elif best_ask < Decimal("0.15"):
+                    rejection_reason = f"Ask ${best_ask:.2f} is below minimum price floor ($0.15)"
+                elif best_bid < Decimal("0.01"):
+                    rejection_reason = f"Bid ${best_bid:.2f} is below minimum bid floor ($0.01)"
+                elif best_ask < best_bid:
+                    rejection_reason = f"Crossed orderbook detected (Bid ${best_bid:.4f} > Ask ${best_ask:.4f})"
+                elif spread > max_spread:
+                    rejection_reason = f"Spread ${spread:.4f} exceeds max_spread (${max_spread:.4f})"
+                    
+                if rejection_reason:
+                    logger.warning(f"[{asset_symbol}] Orderbook rejected: {rejection_reason} (Bid: ${best_bid:.4f}, Ask: ${best_ask:.4f}).")
                     return
                     
                 limit_price = max(Decimal("0.01"), min(Decimal("0.99"), best_ask))
