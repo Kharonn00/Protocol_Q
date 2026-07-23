@@ -1476,6 +1476,8 @@ class LiveTradingEngine:
     async def _evaluate_index_lag_entry(self, asset_symbol: str, state: AssetState, current_time: float):
         if self.shutting_down or not state.active_contract_id or current_time < state.cooldown_until:
             return
+        if state.active_contract_id == getattr(state, "last_traded_event", ""):
+            return
         if current_time - getattr(state, "last_signal_time", 0.0) < float(config.SIGNAL_EVAL_THROTTLE_SECS):
             return
         if self.circuit_breaker.is_locked_out():
@@ -1509,6 +1511,8 @@ class LiveTradingEngine:
     # ==========================================
     async def _evaluate_ofi_entry(self, asset_symbol: str, state: AssetState, current_time: float):
         if self.shutting_down or not state.active_contract_id or current_time < state.cooldown_until:
+            return
+        if state.active_contract_id == getattr(state, "last_traded_event", ""):
             return
         if current_time - getattr(state, "last_signal_time", 0.0) < float(config.SIGNAL_EVAL_THROTTLE_SECS):
             return
