@@ -3,7 +3,7 @@
 ## Executive Summary
 The Kalshi Quantitative Trading Engine is a high-frequency, fully asynchronous algorithmic trading daemon designed to execute asymmetric taker strategies on Kalshi's 15-minute Cryptocurrency Options markets. Built on absolute Zero-Trust security principles and strict $O(1)$ memory bounds, the engine aggregates Binance, Bybit, and Hyperliquid futures liquidation streams alongside Coinbase spot transaction feeds to perfectly time and snipe explosive macro-level breakouts in the Kalshi options chain.
 
-Currently deployed as an optimized, multi-stage AWS ECS Fargate service, the daemon operates the **Liquidation Sniper** (Strategy 1) as its primary execution vehicle. Strategy 2 (Z-Score Sniper) and Strategy 3 (DOGE Theta Harvester) are **currently commented out / deactivated** to focus capital allocation strictly on high-leverage directional breakouts.
+Currently deployed as an optimized, multi-stage AWS ECS Fargate service, the daemon operates **Strategy 1 (Liquidation Sniper)**, **Strategy 4 (CF Benchmarks Index Lag Arbitrage)**, and **Strategy 5 (Taker Order Flow Imbalance)** as its active execution vehicles. Strategy 2 (Z-Score Sniper) and Strategy 3 (DOGE Theta Harvester) are **currently commented out / deactivated** to focus capital allocation strictly on high-edge quantitative signals.
 
 ---
 
@@ -11,13 +11,13 @@ Currently deployed as an optimized, multi-stage AWS ECS Fargate service, the dae
 
 * **Runtime Environment:** Python 3.12-slim and Rust (ABI-aligned multi-stage compilation).
 * **Package Modularization (`engine/` Package):**
-  * `engine/config.py`: Centralized `BotConfig`, default `config` instance, `GLOBAL_SSL_CONTEXT`, `TRUSTED_INTERNAL_HOSTS` whitelist, and precompiled regexes (`DOLLAR_STRIKE_RE`, `GENERIC_NUMBER_RE`, `_ANSI_ESCAPE_RE`).
-  * `engine/models.py`: `AssetState`, `PerformanceTracker`, zero-trust Pydantic schema validation (`EconomicEvent`, `EconomicCalendarResponse`), type-safe financial parsers (`safe_decimal`, `safe_int`), fast ticker validators (`validate_tick_data`, `validate_binance_payload`), and a fallback `PyFastIndicators` handler for environments where the Rust FFI extension is absent.
+  * `engine/config.py`: Centralized `BotConfig`, default `config` instance, `GLOBAL_SSL_CONTEXT`, `TRUSTED_INTERNAL_HOSTS` whitelist, strategy parameters (`INDEX_LAG_MIN_DIVERGENCE`, `OFI_BUY_SELL_RATIO`, `OFI_MIN_VOLUME_NOTIONAL`), and precompiled regexes (`DOLLAR_STRIKE_RE`, `GENERIC_NUMBER_RE`, `_ANSI_ESCAPE_RE`).
+  * `engine/models.py`: `AssetState`, `PerformanceTracker`, zero-trust Pydantic schema validation (`EconomicEvent`, `EconomicCalendarResponse`), type-safe financial parsers (`safe_decimal`, `safe_int`), fast ticker validators (`validate_tick_data` with explicit side & volume checks, `validate_binance_payload`), and fallback handlers (`PyFastIndicators`, `DummyIndexLagTracker`, `DummyTakerOrderFlowTracker`) for environments without Rust FFI binaries.
   * `engine/security.py`: `SafeResolver` (SSRF & DNS rebinding defense), `MacroCircuitBreaker`, `sanitize_log_str` (CWE-117 log injection and ANSI escape defense), `is_private_ip`, `safe_drain_queue`, `calculate_backoff_delay`, `handle_health_check`, and `log_exception_group`.
   * `engine/broker.py`: `ExecutionBroker` abstract base class, `SimExecutionBroker`, `LiveKalshiBroker`, RSA-PSS V2 protocol request signing, REST API methods, paper trading orderbook matching engine (`_paper_orders` with atomic lock protection), and `_extract_fill_price` helper.
-  * `engine/strategy.py`: Core `LiveTradingEngine`, Binance Liquidation Sniper, laddered Take-Profit lifecycle monitor, settlement reconciliation loops, multi-venue WebSocket ingestion consumers (Coinbase, Binance, Bybit, Hyperliquid, Kalshi Private), and `get_kalshi_credentials` (AWS Secrets Manager zero-residency PEM loader).
+  * `engine/strategy.py`: Core `LiveTradingEngine`, Binance Liquidation Sniper, Index Lag Arbitrage, Taker Order Flow Imbalance, generic signal router, laddered Take-Profit lifecycle monitor, settlement reconciliation loops, multi-venue WebSocket ingestion consumers, and `get_kalshi_credentials` (AWS Secrets Manager zero-residency PEM loader).
   * `kalshi_main.py`: Lightweight 100-line entry point bootstrapper script that instantiates `LiveTradingEngine` and manages the asyncio event loop.
-* **Rust PyO3 Extension:** Native compiled `kalshi_bot` library provides `FastIndicators` for ultra-low latency, GIL-free technical calculations (Bollinger Bands, EMA, RSI, and running Z-Scores).
+* **Rust PyO3 Extension:** Native compiled `kalshi_bot` library provides `FastIndicators` (Bollinger Bands, EMA, RSI, Z-Scores), `IndexLagTracker` ($O(1)$ 60s index moving average ring buffer), and `TakerOrderFlowTracker` ($O(1)$ 30s trade tape imbalance tracker) with strict capacity bounds (5,000 max capacity) and timestamp sequence validation.
 * **Orchestration:** AWS Elastic Container Service (ECS) with Fargate (`readonlyRootFilesystem: true`).
 * **State Management:** Fully stateless, ephemeral execution engine (Twelve-Factor App Compliant).
 * **Secret Management:** AWS Secrets Manager via `boto3` (No local key storage).
@@ -57,9 +57,19 @@ Waits exclusively for massive directional futures liquidations to capture explos
 ### 3. DOGE Theta Harvester - [DEACTIVATED]
 * *Status*: Commented out / disabled due to asymmetric risk-expectancy profiles.
 
-### 4. Macroeconomic Circuit Breaker (The Steamroller Defense) - [ACTIVE]
+### 4. CF Benchmarks Index Lag Arbitrage - [ACTIVE]
+Exploits the 60-second rolling average calculation lag of the settlement index during sudden price surges.
+* **Mechanism**: Rust `IndexLagTracker` maintains an $O(1)$ ring buffer tracking spot prices over 60 seconds. When spot price diverges from the 60s moving average by more than `INDEX_LAG_MIN_DIVERGENCE` (0.12%), a directional signal fires.
+* **Risk Controls**: Operates strictly within the Golden Window (1.5 to 8.0 minutes remaining) and enforces standard price caps (`MAX_ENTRY_PRICE_YES` $\le \$0.55$, `MAX_ENTRY_PRICE_NO` $\le \$0.75$).
+
+### 5. Taker Order Flow Imbalance (OFI) - [ACTIVE]
+Tracks completed cash-register taker trades (`match` events) to capture institutional order flow momentum.
+* **Zero-L2 Policy**: Strictly ignores resting limit orders, making the strategy 100% immune to L2 orderbook spoofing.
+* **Mechanism**: Rust `TakerOrderFlowTracker` maintains an $O(1)$ 30-second trade tape volume buffer. Fires when Taker Buy/Sell volume ratio exceeds `OFI_BUY_SELL_RATIO` (3.5x) on minimum notional volume `OFI_MIN_VOLUME_NOTIONAL` ($50,000).
+
+### 6. Macroeconomic Circuit Breaker (The Steamroller Defense) - [ACTIVE]
 Fundamentally prevents the bot from trading during exogenous regime shifts.
-* Fetches economic releases schedule schedule via a static JSON feed.
+* Fetches economic releases schedule via a static feed.
 * Temporal lockout (30-minute window before/after the event) blocks trading, preventing adverse selection during high-impact USD economic events.
 
 ---
@@ -89,6 +99,9 @@ The system is engineered assuming a strictly hostile network and execution envir
 * **Shielded Task Cancellation Cleanups (Zero-Leak Execution)**: Cleanup routines (order cancellation and final balance/position reconciliation) are wrapped in background coroutines shielded via `_safe_shield`, ensuring they execute to completion in the event loop even if the parent task is aborted or timed out.
 * **Double-Checked Locking (DCL) Concurrency Shield**: Checks position bounds locklessly, yields to retrieve market prices, and then validates state inside a synchronous `balance_lock` to stop duplicate execution races.
 * **Heap Memory Cryptographic Hardening**: Overwrites immutable string dictionary entries (`SecretString`, `PRIVATE_KEY`, `KEY_ID`) inside Secrets Manager decoding, zeroes mutable `bytearray` buffers with `ctypes.memset`, and performs double `gc.collect()` passes on shutdown to eliminate OpenSSL key residency.
+* **Rust FFI Queue Capacity Bounding (SEV-1 Mitigation)**: Implements hard 5,000-element capacity caps on Rust `IndexLagTracker` and `TakerOrderFlowTracker` ring buffers to prevent out-of-memory (OOM) heap exhaustion under tick floods.
+* **Zero-Lockout Execution Cooldowns**: Mutates `state.cooldown_until` strictly inside atomic `balance_lock` closures upon confirmed capital deduction. Orderbook rejections (ask > limit, spread bounds, distance gates) trigger zero lockout (`0s`), allowing immediate subsequent strategy evaluation.
+* **Strict Payload & Sequence Validation**: Enforces explicit `"side"` validation (`"buy"`/`"sell"`) and positive volume checks (`volume > 0.0`) in `validate_tick_data`, and rejects out-of-order timestamps in Rust queues.
 
 ## 🧠 Memory & Concurrency Optimization
 
