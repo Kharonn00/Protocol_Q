@@ -585,11 +585,11 @@ class LiveTradingEngine:
                 
                 tranches = []
                 if t1_qty > 0:
-                    tranches.append((t1_qty, t1_price, "T1-conservative"))
+                    tranches.append((t1_qty, t1_price, "t1"))
                 if t2_qty > 0:
-                    tranches.append((t2_qty, t2_price, "T2-dynamic"))
+                    tranches.append((t2_qty, t2_price, "t2"))
                 if t3_qty > 0:
-                    tranches.append((t3_qty, t3_price, "T3-aggressive"))
+                    tranches.append((t3_qty, t3_price, "t3"))
 
                 capped_count = sum(1 for _, tp, _ in tranches if tp == Decimal("0.99"))
                 if len(tranches) > 0 and capped_count >= 2:

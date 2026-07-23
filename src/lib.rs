@@ -144,6 +144,7 @@ impl FastIndicators {
         if self.count < self.period + 1 {
             return 50.0; 
         }
+        if self.avg_gain == 0.0 && self.avg_loss == 0.0 { return 50.0; }
         if self.avg_loss == 0.0 { return 100.0; }
         
         let rs = self.avg_gain / self.avg_loss;
@@ -164,22 +165,25 @@ impl FastIndicators {
     }
 }
 
-/// O(1) 60-second rolling index tracker for CF Benchmark simulation
+/// O(1) 60-second settlement index average tracker (lag indicator)
 #[pyclass]
 pub struct IndexLagTracker {
     ticks: std::collections::VecDeque<(f64, f64)>, // (timestamp, price)
     sum_price: f64,
     window_sec: f64,
+    insert_count: u64,
 }
 
 #[pymethods]
 impl IndexLagTracker {
     #[new]
+    #[pyo3(signature = (window_sec=None))]
     pub fn new(window_sec: Option<f64>) -> Self {
         IndexLagTracker {
             ticks: std::collections::VecDeque::with_capacity(1024),
             sum_price: 0.0,
             window_sec: window_sec.unwrap_or(60.0),
+            insert_count: 0,
         }
     }
 
@@ -191,6 +195,7 @@ impl IndexLagTracker {
             if timestamp < last_ts { return; }
         }
 
+        self.insert_count += 1;
         self.ticks.push_back((timestamp, price));
         self.sum_price += price;
 
@@ -213,7 +218,7 @@ impl IndexLagTracker {
 
         if self.ticks.is_empty() {
             self.sum_price = 0.0;
-        } else if self.ticks.len() % 128 == 0 {
+        } else if self.insert_count % 128 == 0 {
             self.sum_price = self.ticks.iter().map(|&(_, p)| p).sum();
         }
     }
@@ -245,11 +250,13 @@ pub struct TakerOrderFlowTracker {
     last_ofi_side: String,
     ofi_persistence_count: i32,
     last_ofi_check_time: f64,
+    insert_count: u64,
 }
 
 #[pymethods]
 impl TakerOrderFlowTracker {
     #[new]
+    #[pyo3(signature = (window_sec=None))]
     pub fn new(window_sec: Option<f64>) -> Self {
         TakerOrderFlowTracker {
             trades: std::collections::VecDeque::with_capacity(1024),
@@ -259,6 +266,7 @@ impl TakerOrderFlowTracker {
             last_ofi_side: "".to_string(),
             ofi_persistence_count: 0,
             last_ofi_check_time: 0.0,
+            insert_count: 0,
         }
     }
 
@@ -270,6 +278,7 @@ impl TakerOrderFlowTracker {
             if timestamp < last_ts { return; }
         }
 
+        self.insert_count += 1;
         self.trades.push_back((timestamp, volume_notional, is_buy));
         if is_buy {
             self.total_buy_vol += volume_notional;
@@ -305,7 +314,7 @@ impl TakerOrderFlowTracker {
         if self.trades.is_empty() {
             self.total_buy_vol = 0.0;
             self.total_sell_vol = 0.0;
-        } else if self.trades.len() % 128 == 0 {
+        } else if self.insert_count % 128 == 0 {
             self.total_buy_vol = self.trades.iter().filter(|&&(_, _, is_b)| is_b).map(|&(_, v, _)| v).sum();
             self.total_sell_vol = self.trades.iter().filter(|&&(_, _, is_b)| !is_b).map(|&(_, v, _)| v).sum();
         }

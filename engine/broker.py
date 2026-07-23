@@ -703,11 +703,12 @@ class LiveKalshiBroker(ExecutionBroker):
                         return None
                     self._paper_balance -= total_trade_value
                     
-                if len(self._paper_orders) >= 1000:
+                if len(self._paper_orders) >= 10000:
                     stale_keys = [k for k in self._paper_orders
                                   if self._paper_orders[k].get("status") in ("executed", "canceled")]
                     if stale_keys:
-                        del self._paper_orders[stale_keys[0]]
+                        for sk in stale_keys[:100]:
+                            del self._paper_orders[sk]
                     else:
                         oldest_key = next(iter(self._paper_orders))
                         logger.warning(f"[SECURITY] FIFO evicting active paper order {oldest_key}. Potential TP monitor orphan.")
