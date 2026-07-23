@@ -1389,6 +1389,8 @@ class LiveTradingEngine:
     async def _evaluate_index_lag_entry(self, asset_symbol: str, state: AssetState, current_time: float):
         if self.shutting_down or not state.active_contract_id or current_time < state.cooldown_until:
             return
+        if current_time - getattr(state, "last_signal_time", 0.0) < 2.0:
+            return
         if self.circuit_breaker.is_locked_out():
             return
             
@@ -1409,6 +1411,7 @@ class LiveTradingEngine:
         if abs(divergence) < min_div:
             return
 
+        state.last_signal_time = current_time
         trade_side = "YES" if divergence > 0.0 else "NO"
         div_pct = divergence * 100.0
         logger.info(f"[{asset_symbol}] INDEX LAG SIGNAL! Spot: ${current_spot:.2f} | 60s Avg: ${state.index_lag_tracker.get_average():.2f} | Div: {div_pct:+.3f}% | Side: {trade_side}")
@@ -1419,6 +1422,8 @@ class LiveTradingEngine:
     # ==========================================
     async def _evaluate_ofi_entry(self, asset_symbol: str, state: AssetState, current_time: float):
         if self.shutting_down or not state.active_contract_id or current_time < state.cooldown_until:
+            return
+        if current_time - getattr(state, "last_signal_time", 0.0) < 2.0:
             return
         if self.circuit_breaker.is_locked_out():
             return
@@ -1448,6 +1453,7 @@ class LiveTradingEngine:
         if not trade_side:
             return
 
+        state.last_signal_time = current_time
         logger.info(f"[{asset_symbol}] TAKER OFI SIGNAL! 30s BuyVol: ${buy_vol:,.0f} | SellVol: ${sell_vol:,.0f} | Ratio: {ratio:.2f}x | Side: {trade_side}")
         await self._route_generic_signal_entry(asset_symbol, state, trade_side, f"TAKER_OFI ({ratio:.1f}x)", current_time, seconds_left)
 
