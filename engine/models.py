@@ -156,6 +156,9 @@ class AssetState:
         self.last_seen_contract_id: str = ""
         self.last_traded_event: str = ""
         self.last_signal_time: float = 0.0
+        self.last_ofi_check_time: float = 0.0
+        self.last_ofi_side: str = ""
+        self.ofi_persistence_count: int = 0
 
         # Transitioned to O(1) Exponential Variables
         self.tick_count: int = 0

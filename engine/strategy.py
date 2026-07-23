@@ -1451,10 +1451,25 @@ class LiveTradingEngine:
             trade_side = "NO"
 
         if not trade_side:
+            state.ofi_persistence_count = 0
+            state.last_ofi_side = ""
+            return
+
+        if trade_side == getattr(state, "last_ofi_side", ""):
+            if current_time - getattr(state, "last_ofi_check_time", 0.0) >= 2.5:
+                state.ofi_persistence_count += 1
+                state.last_ofi_check_time = current_time
+        else:
+            state.last_ofi_side = trade_side
+            state.ofi_persistence_count = 1
+            state.last_ofi_check_time = current_time
+
+        if state.ofi_persistence_count < 2:
+            logger.info(f"[{asset_symbol}] TAKER OFI CANDIDATE! ({trade_side} | Ratio: {ratio:.2f}x) Persistence: {state.ofi_persistence_count}/2. Awaiting 2.5s confirmation...")
             return
 
         state.last_signal_time = current_time
-        logger.info(f"[{asset_symbol}] TAKER OFI SIGNAL! 30s BuyVol: ${buy_vol:,.0f} | SellVol: ${sell_vol:,.0f} | Ratio: {ratio:.2f}x | Side: {trade_side}")
+        logger.info(f"[{asset_symbol}] 🎯 CONFIRMED TAKER OFI SIGNAL (2/2 Persistence)! 30s BuyVol: ${buy_vol:,.0f} | SellVol: ${sell_vol:,.0f} | Ratio: {ratio:.2f}x | Side: {trade_side}")
         await self._route_generic_signal_entry(asset_symbol, state, trade_side, f"TAKER_OFI ({ratio:.1f}x)", current_time, seconds_left)
 
     # ==========================================
