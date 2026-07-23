@@ -1110,13 +1110,21 @@ class LiveTradingEngine:
         state.tick_count += 1
         state.last_tick_time = time.time()
         tick_volume = tick_dict.get("volume", 0.0)
+        tick_side = tick_dict.get("side", "buy")
         if tick_volume and tick_volume > 0:
             usd_notional_k = (float(tick_price) * float(tick_volume)) / 1000.0
             state.fast_indicators.add_price_with_volume(tick_price, usd_notional_k)
+            state.taker_ofi_tracker.add_trade(current_time, float(tick_price) * float(tick_volume), tick_side == "buy")
         else:
             state.fast_indicators.add_price(tick_price)
 
+        state.index_lag_tracker.add_tick(current_time, tick_price)
         state.last_price = float(tick_price)
+
+        if config.ENABLE_INDEX_LAG_STRATEGY:
+            await self._evaluate_index_lag_entry(product_id, state, current_time)
+        if config.ENABLE_OFI_STRATEGY:
+            await self._evaluate_ofi_entry(product_id, state, current_time)
 
     # ==========================================
     # BINANCE LIQUIDATION SNIPER
@@ -1241,8 +1249,6 @@ class LiveTradingEngine:
                     if self.active_trade_count >= config.MAX_CONCURRENT_TRADES: return
                     self.active_trade_count += 1
                     slot_acquired = True
-                    
-                state.cooldown_until = current_time + 15.0
                 best_vals = await self.broker.get_best_bid_ask(executing_contract_id, trade_side)
                 if not best_vals:
                     return
@@ -1376,6 +1382,214 @@ class LiveTradingEngine:
                 
         except Exception as e:
             logger.error("Liquidation processing fault", exc_info=True) 
+
+    # ==========================================
+    # STRATEGY 4: INDEX LAG ARBITRAGE
+    # ==========================================
+    async def _evaluate_index_lag_entry(self, asset_symbol: str, state: AssetState, current_time: float):
+        if self.shutting_down or not state.active_contract_id or current_time < state.cooldown_until:
+            return
+        if self.circuit_breaker.is_locked_out():
+            return
+            
+        seconds_left = state.expiration_time - current_time if state.expiration_time else 720.0
+        if seconds_left < 90.0 or seconds_left > 480.0:
+            return
+
+        current_hour = int(datetime.datetime.now(datetime.timezone.utc).hour)
+        if not self.performance_tracker.should_trade(asset_symbol, current_hour):
+            return
+
+        if state.last_price is None or state.last_price <= 0.0:
+            return
+        current_spot = float(state.last_price)
+        divergence = state.index_lag_tracker.get_divergence(current_spot)
+        min_div = float(config.INDEX_LAG_MIN_DIVERGENCE)
+
+        if abs(divergence) < min_div:
+            return
+
+        trade_side = "YES" if divergence > 0.0 else "NO"
+        div_pct = divergence * 100.0
+        logger.info(f"[{asset_symbol}] INDEX LAG SIGNAL! Spot: ${current_spot:.2f} | 60s Avg: ${state.index_lag_tracker.get_average():.2f} | Div: {div_pct:+.3f}% | Side: {trade_side}")
+        await self._route_generic_signal_entry(asset_symbol, state, trade_side, f"INDEX_LAG ({div_pct:+.2f}%)", current_time, seconds_left)
+
+    # ==========================================
+    # STRATEGY 5: TAKER ORDER FLOW IMBALANCE (OFI)
+    # ==========================================
+    async def _evaluate_ofi_entry(self, asset_symbol: str, state: AssetState, current_time: float):
+        if self.shutting_down or not state.active_contract_id or current_time < state.cooldown_until:
+            return
+        if self.circuit_breaker.is_locked_out():
+            return
+            
+        seconds_left = state.expiration_time - current_time if state.expiration_time else 720.0
+        if seconds_left < 90.0 or seconds_left > 480.0:
+            return
+
+        current_hour = int(datetime.datetime.now(datetime.timezone.utc).hour)
+        if not self.performance_tracker.should_trade(asset_symbol, current_hour):
+            return
+
+        buy_vol, sell_vol, ratio = state.taker_ofi_tracker.get_metrics()
+        total_vol = buy_vol + sell_vol
+        min_vol = float(config.OFI_MIN_VOLUME_NOTIONAL)
+        target_ratio = float(config.OFI_BUY_SELL_RATIO)
+
+        if total_vol < min_vol:
+            return
+
+        trade_side = None
+        if ratio >= target_ratio:
+            trade_side = "YES"
+        elif sell_vol > 0.0 and (sell_vol / max(buy_vol, 1.0)) >= target_ratio:
+            trade_side = "NO"
+
+        if not trade_side:
+            return
+
+        logger.info(f"[{asset_symbol}] TAKER OFI SIGNAL! 30s BuyVol: ${buy_vol:,.0f} | SellVol: ${sell_vol:,.0f} | Ratio: {ratio:.2f}x | Side: {trade_side}")
+        await self._route_generic_signal_entry(asset_symbol, state, trade_side, f"TAKER_OFI ({ratio:.1f}x)", current_time, seconds_left)
+
+    # ==========================================
+    # GENERIC SIGNAL ROUTER
+    # ==========================================
+    async def _route_generic_signal_entry(self, asset_symbol: str, state: AssetState, trade_side: str, signal_tag: str, current_time: float, seconds_left: float):
+        if self.last_sync_time == 0.0 or time.time() - self.last_sync_time > config.STALE_BALANCE_TIMEOUT_SEC:
+            return
+
+        executing_contract_id = state.active_contract_id
+        if executing_contract_id == getattr(state, "last_traded_event", ""):
+            return
+
+        slot_acquired = False
+        local_mutated = False
+        try:
+            async with self.trade_cap_lock:
+                if self.active_trade_count >= config.MAX_CONCURRENT_TRADES:
+                    return
+                self.active_trade_count += 1
+                slot_acquired = True
+
+            best_vals = await self.broker.get_best_bid_ask(executing_contract_id, trade_side)
+            if not best_vals:
+                return
+
+            if self.circuit_breaker.is_locked_out():
+                return
+
+            current_time = time.time()
+            sec_left_now = state.expiration_time - current_time if state.expiration_time else 720.0
+            if sec_left_now < 90.0 or sec_left_now > 480.0:
+                return
+
+            if executing_contract_id != state.active_contract_id:
+                return
+
+            best_bid, best_ask, bid_depth, ask_depth = best_vals
+            if best_ask.is_nan() or best_bid.is_nan():
+                return
+            spread = best_ask - best_bid
+
+            max_spread = min(config.MAX_ALLOWED_SPREAD, max(Decimal("0.05"), best_bid * Decimal("0.30")))
+            max_entry_price = config.MAX_ENTRY_PRICE_YES if trade_side == "YES" else config.MAX_ENTRY_PRICE_NO
+
+            rejection_reason = None
+            if best_ask > max_entry_price:
+                rejection_reason = f"Ask ${best_ask:.2f} exceeds {trade_side} MAX_ENTRY_PRICE (${max_entry_price:.2f})"
+            elif best_ask < Decimal("0.15"):
+                rejection_reason = f"Ask ${best_ask:.2f} is below minimum price floor ($0.15)"
+            elif best_bid < Decimal("0.01"):
+                rejection_reason = f"Bid ${best_bid:.2f} is below minimum bid floor ($0.01)"
+            elif best_ask < best_bid:
+                rejection_reason = f"Crossed orderbook detected (Bid ${best_bid:.4f} > Ask ${best_ask:.4f})"
+            elif spread > max_spread:
+                rejection_reason = f"Spread ${spread:.4f} exceeds max_spread (${max_spread:.4f})"
+
+            if rejection_reason:
+                logger.warning(f"[{asset_symbol}] [{signal_tag}] Orderbook rejected: {rejection_reason} (Bid: ${best_bid:.4f}, Ask: ${best_ask:.4f}).")
+                return
+
+            limit_price = max(Decimal("0.01"), min(Decimal("0.99"), best_ask))
+
+            if state.strike_price and state.last_price:
+                spot_price = Decimal(str(state.last_price))
+                strike_price = Decimal(str(state.strike_price))
+                mean, upper, lower = state.fast_indicators.get_bollinger_bands()
+                std_dev = (upper - mean) / 2.0
+                floor_pct = config.STD_DEV_FLOORS_PCT.get(asset_symbol, 0.0005)
+                floor = floor_pct * float(state.last_price)
+                std_dev_dec = Decimal(str(max(std_dev, floor)))
+
+                if trade_side == "YES" and spot_price < strike_price:
+                    distance = strike_price - spot_price
+                    if distance > Decimal("1.5") * std_dev_dec:
+                        logger.info(f"[{asset_symbol}] [{signal_tag}] Drop: YES trade blocked. Spot ${spot_price} is too far below Strike ${strike_price}.")
+                        return
+                elif trade_side == "NO" and spot_price > strike_price:
+                    distance = spot_price - strike_price
+                    if distance > Decimal("1.5") * std_dev_dec:
+                        logger.info(f"[{asset_symbol}] [{signal_tag}] Drop: NO trade blocked. Spot ${spot_price} is too far above Strike ${strike_price}.")
+                        return
+
+            should_decrement = False
+            async with self.balance_lock:
+                if executing_contract_id == getattr(state, "last_traded_event", ""):
+                    should_decrement = True
+                else:
+                    current_pos_side = state.position_sides.get(executing_contract_id)
+                    if current_pos_side and current_pos_side != trade_side:
+                        should_decrement = True
+                    else:
+                        actual_pos_size = state.positions.get(executing_contract_id, 0)
+                        remaining_exposure = config.MAX_EXPOSURE_PER_EVENT - actual_pos_size
+                        if remaining_exposure <= 0:
+                            should_decrement = True
+                        else:
+                            trade_budget = self.available_balance * config.TRADE_BUDGET_PCT
+                            raw_quantity = int(trade_budget / limit_price)
+                            quantity = min(raw_quantity, config.MAX_CONTRACTS_PER_TRADE, remaining_exposure)
+                            if quantity < 30:
+                                should_decrement = True
+                            else:
+                                total_cost = Decimal(quantity) * limit_price
+                                if self.available_balance >= total_cost:
+                                    self.available_balance -= total_cost
+                                    self.capital_in_flight += total_cost
+                                    state.position_sides[executing_contract_id] = trade_side
+                                    state.positions[executing_contract_id] = actual_pos_size + quantity
+                                    state.last_traded_event = executing_contract_id
+                                    state.cooldown_until = current_time + 15.0
+                                    self.state_sequence += 1
+                                    local_mutated = True
+                                else:
+                                    should_decrement = True
+
+            if should_decrement:
+                return
+
+            logger.warning(f"[{asset_symbol}] [{signal_tag}] SIGNAL EXECUTING! Ask: ${best_ask:.2f} | Sniping {quantity} contracts.")
+            exec_task = asyncio.create_task(
+                self.execute_and_hold_entry(
+                    state, executing_contract_id, trade_side, limit_price, quantity, total_cost, sec_left_now
+                )
+            )
+            self._pending_tasks.add(exec_task)
+            exec_task.add_done_callback(self._handle_task_done)
+            slot_acquired = False
+        except Exception as inner_e:
+            logger.error(f"[{signal_tag}] Execution fault", exc_info=True)
+            if 'exec_task' in locals():
+                if not exec_task.done():
+                    exec_task.cancel()
+            if local_mutated and slot_acquired:
+                await self._safe_shield(self._update_local_state(total_cost, -total_cost, state, executing_contract_id, -quantity))
+                if getattr(state, "last_traded_event", "") == executing_contract_id:
+                    state.last_traded_event = ""
+            raise
+        finally:
+            if slot_acquired:
+                await self._safe_shield(self._decrement_trade_cap()) 
 
 # ==========================================
 # ASYNC QUEUES

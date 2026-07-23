@@ -31,8 +31,21 @@ except ImportError:
             std_dev = (self.var ** 0.5) if self.var > 0 else 0.0
             return self.ema, self.ema + 2.0 * std_dev, self.ema - 2.0 * std_dev
 
+    class DummyIndexLagTracker:
+        def __init__(self, window_sec: float = 60.0): pass
+        def add_tick(self, ts: float, price: float): pass
+        def get_average(self) -> float: return 0.0
+        def get_divergence(self, spot: float) -> float: return 0.0
+
+    class DummyTakerOrderFlowTracker:
+        def __init__(self, window_sec: float = 30.0): pass
+        def add_trade(self, ts: float, vol: float, is_buy: bool): pass
+        def get_metrics(self) -> Tuple[float, float, float]: return 0.0, 0.0, 1.0
+
     class DummyKalshiBotModule:
         FastIndicators = PyFastIndicators
+        IndexLagTracker = DummyIndexLagTracker
+        TakerOrderFlowTracker = DummyTakerOrderFlowTracker
 
     kalshi_bot = DummyKalshiBotModule()
 
@@ -69,14 +82,27 @@ def validate_tick_data(data: dict) -> Optional[dict]:
         return None
         
     try:
-        tick_volume = float(data.get("last_size", 0)) if data.get("last_size") else 0.0
+        raw_vol = data.get("last_size")
+        if raw_vol is None:
+            return None
+        tick_volume = float(raw_vol)
+        if tick_volume <= 0.0:
+            return None
     except (ValueError, TypeError):
-        tick_volume = 0.0
+        return None
+
+    raw_side = data.get("side")
+    if not isinstance(raw_side, str):
+        return None
+    side_clean = raw_side.lower()
+    if side_clean not in ("buy", "sell"):
+        return None
 
     return {
         "product_id": prod_id,
         "price": price_dec,
-        "volume": tick_volume
+        "volume": tick_volume,
+        "side": side_clean
     }
 
 def validate_binance_payload(data: dict) -> Optional[dict]:
@@ -134,6 +160,8 @@ class AssetState:
         self.tick_count: int = 0
         self.last_tick_time: float = 0.0
         self.fast_indicators = kalshi_bot.FastIndicators(14, float(config.EMA_ALPHA))
+        self.index_lag_tracker = kalshi_bot.IndexLagTracker(60.0)
+        self.taker_ofi_tracker = kalshi_bot.TakerOrderFlowTracker(30.0)
         self.consecutive_outliers: int = 0  
         
         # Restored to satisfy strict interface contracts and prevent AttributeError

@@ -164,8 +164,156 @@ impl FastIndicators {
     }
 }
 
+/// O(1) 60-second rolling index tracker for CF Benchmark simulation
+#[pyclass]
+pub struct IndexLagTracker {
+    ticks: std::collections::VecDeque<(f64, f64)>, // (timestamp, price)
+    sum_price: f64,
+    window_sec: f64,
+}
+
+#[pymethods]
+impl IndexLagTracker {
+    #[new]
+    pub fn new(window_sec: Option<f64>) -> Self {
+        IndexLagTracker {
+            ticks: std::collections::VecDeque::with_capacity(1024),
+            sum_price: 0.0,
+            window_sec: window_sec.unwrap_or(60.0),
+        }
+    }
+
+    pub fn add_tick(&mut self, timestamp: f64, price: f64) {
+        if !price.is_finite() || !timestamp.is_finite() || price <= 0.0 { return; }
+
+        // SEV-3: Reject out-of-order timestamps to prevent queue traps
+        if let Some(&(last_ts, _)) = self.ticks.back() {
+            if timestamp < last_ts { return; }
+        }
+
+        self.ticks.push_back((timestamp, price));
+        self.sum_price += price;
+
+        // SEV-1: Hard capacity cap to enforce strict O(1) space invariant under tick floods
+        while self.ticks.len() > 5000 {
+            if let Some((_, old_price)) = self.ticks.pop_front() {
+                self.sum_price -= old_price;
+            }
+        }
+
+        let cutoff = timestamp - self.window_sec;
+        while let Some(&(ts, old_price)) = self.ticks.front() {
+            if ts < cutoff {
+                self.sum_price -= old_price;
+                self.ticks.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn get_average(&self) -> f64 {
+        if self.ticks.is_empty() { return 0.0; }
+        self.sum_price / (self.ticks.len() as f64)
+    }
+
+    /// Returns fractional divergence: (spot_price - 60s_avg) / 60s_avg
+    pub fn get_divergence(&self, current_spot: f64) -> f64 {
+        let avg = self.get_average();
+        if avg <= 0.0 || !current_spot.is_finite() || current_spot <= 0.0 { return 0.0; }
+        (current_spot - avg) / avg
+    }
+
+    pub fn len(&self) -> usize {
+        self.ticks.len()
+    }
+}
+
+/// O(1) 30-second Taker Order Flow Imbalance tracker (un-spoofable trade tape)
+#[pyclass]
+pub struct TakerOrderFlowTracker {
+    trades: std::collections::VecDeque<(f64, f64, bool)>, // (timestamp, volume_notional, is_buy)
+    total_buy_vol: f64,
+    total_sell_vol: f64,
+    window_sec: f64,
+}
+
+#[pymethods]
+impl TakerOrderFlowTracker {
+    #[new]
+    pub fn new(window_sec: Option<f64>) -> Self {
+        TakerOrderFlowTracker {
+            trades: std::collections::VecDeque::with_capacity(1024),
+            total_buy_vol: 0.0,
+            total_sell_vol: 0.0,
+            window_sec: window_sec.unwrap_or(30.0),
+        }
+    }
+
+    pub fn add_trade(&mut self, timestamp: f64, volume_notional: f64, is_buy: bool) {
+        if !volume_notional.is_finite() || volume_notional <= 0.0 || !timestamp.is_finite() { return; }
+
+        // SEV-3: Reject out-of-order timestamps to prevent queue traps
+        if let Some(&(last_ts, _, _)) = self.trades.back() {
+            if timestamp < last_ts { return; }
+        }
+
+        self.trades.push_back((timestamp, volume_notional, is_buy));
+        if is_buy {
+            self.total_buy_vol += volume_notional;
+        } else {
+            self.total_sell_vol += volume_notional;
+        }
+
+        // SEV-1: Hard capacity cap to enforce strict O(1) space invariant under trade floods
+        while self.trades.len() > 5000 {
+            if let Some((_, old_vol, old_is_buy)) = self.trades.pop_front() {
+                if old_is_buy {
+                    self.total_buy_vol = (self.total_buy_vol - old_vol).max(0.0);
+                } else {
+                    self.total_sell_vol = (self.total_sell_vol - old_vol).max(0.0);
+                }
+            }
+        }
+
+        let cutoff = timestamp - self.window_sec;
+        while let Some(&(ts, old_vol, old_is_buy)) = self.trades.front() {
+            if ts < cutoff {
+                if old_is_buy {
+                    self.total_buy_vol = (self.total_buy_vol - old_vol).max(0.0);
+                } else {
+                    self.total_sell_vol = (self.total_sell_vol - old_vol).max(0.0);
+                }
+                self.trades.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Returns (total_buy_vol, total_sell_vol, buy_to_sell_ratio)
+    pub fn get_metrics(&self) -> (f64, f64, f64) {
+        let buy = self.total_buy_vol;
+        let sell = self.total_sell_vol;
+        let ratio = if sell > 0.0 {
+            buy / sell
+        } else if buy > 0.0 {
+            100.0 // Cap at 100 if no sell volume
+        } else {
+            1.0
+        };
+        (buy, sell, ratio)
+    }
+
+    pub fn len(&self) -> usize {
+        self.trades.len()
+    }
+}
+
 #[pymodule]
 fn kalshi_bot(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FastIndicators>()?;
+    m.add_class::<IndexLagTracker>()?;
+    m.add_class::<TakerOrderFlowTracker>()?;
     Ok(())
 }

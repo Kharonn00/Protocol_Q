@@ -51,6 +51,15 @@ class BotConfig:
     # Safety indicators thresholds
     STRIKE_SAFETY_BUFFER_SD: float = float(os.environ.get("STRIKE_SAFETY_BUFFER_SD", "0.5"))
 
+    # Strategy 4: Index Lag Arbitrage Config
+    ENABLE_INDEX_LAG_STRATEGY: bool = os.environ.get("ENABLE_INDEX_LAG_STRATEGY", "true").lower() == "true"
+    INDEX_LAG_MIN_DIVERGENCE: Decimal = Decimal(os.environ.get("INDEX_LAG_MIN_DIVERGENCE", "0.0012"))
+
+    # Strategy 5: Taker Order Flow Imbalance (OFI) Config
+    ENABLE_OFI_STRATEGY: bool = os.environ.get("ENABLE_OFI_STRATEGY", "true").lower() == "true"
+    OFI_BUY_SELL_RATIO: Decimal = Decimal(os.environ.get("OFI_BUY_SELL_RATIO", "3.5"))
+    OFI_MIN_VOLUME_NOTIONAL: Decimal = Decimal(os.environ.get("OFI_MIN_VOLUME_NOTIONAL", "50000.0"))
+
     def __post_init__(self):
         """SEC-06: Bounds-validate all environment-sourced config to prevent adversarial misconfiguration."""
         if not (Decimal("0.001") <= self.TRADE_BUDGET_PCT <= Decimal("0.20")):
@@ -67,6 +76,12 @@ class BotConfig:
             raise ValueError(f"MAX_ENTRY_PRICE_YES={self.MAX_ENTRY_PRICE_YES} out of safe range [0.10, 0.60]")
         if not (Decimal("0.10") <= self.MAX_ENTRY_PRICE_NO <= Decimal("0.85")):
             raise ValueError(f"MAX_ENTRY_PRICE_NO={self.MAX_ENTRY_PRICE_NO} out of safe range [0.10, 0.85]")
+        if not (Decimal("0.0001") <= self.INDEX_LAG_MIN_DIVERGENCE <= Decimal("0.05")):
+            raise ValueError(f"INDEX_LAG_MIN_DIVERGENCE={self.INDEX_LAG_MIN_DIVERGENCE} out of safe range [0.0001, 0.05]")
+        if not (Decimal("1.5") <= self.OFI_BUY_SELL_RATIO <= Decimal("20.0")):
+            raise ValueError(f"OFI_BUY_SELL_RATIO={self.OFI_BUY_SELL_RATIO} out of safe range [1.5, 20.0]")
+        if not (Decimal("1000.0") <= self.OFI_MIN_VOLUME_NOTIONAL <= Decimal("10000000.0")):
+            raise ValueError(f"OFI_MIN_VOLUME_NOTIONAL={self.OFI_MIN_VOLUME_NOTIONAL} out of safe range [1000, 10000000]")
         for asset, floor_val in self.STD_DEV_FLOORS_PCT.items():
             if not (0.0 <= floor_val <= 1.0):
                 raise ValueError(f"STD_DEV_FLOORS_PCT[{asset}]={floor_val} out of safe range [0.0, 1.0]")
