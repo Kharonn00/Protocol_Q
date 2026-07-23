@@ -366,20 +366,21 @@ impl TakerOrderFlowTracker {
             return ("".to_string(), 0, false);
         }
         
-        let mut is_new_candidate = false;
+        let mut is_transition = false;
         if current_side == self.last_ofi_side {
             if timestamp - self.last_ofi_check_time >= persistence_sec {
                 self.ofi_persistence_count += 1;
                 self.last_ofi_check_time = timestamp;
+                is_transition = true;
             }
         } else {
             self.last_ofi_side = current_side.clone();
             self.ofi_persistence_count = 1;
             self.last_ofi_check_time = timestamp;
-            is_new_candidate = true;
+            is_transition = true;
         }
         
-        (self.last_ofi_side.clone(), self.ofi_persistence_count, is_new_candidate)
+        (self.last_ofi_side.clone(), self.ofi_persistence_count, is_transition)
     }
 
     pub fn len(&self) -> usize {

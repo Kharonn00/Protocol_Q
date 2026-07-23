@@ -1526,18 +1526,17 @@ class LiveTradingEngine:
         target_ratio = float(config.OFI_BUY_SELL_RATIO)
         min_vol = float(config.OFI_MIN_VOLUME_NOTIONAL)
 
-        trade_side, persistence_count, is_new_candidate = state.taker_ofi_tracker.update_and_check_persistence(
+        trade_side, persistence_count, is_transition = state.taker_ofi_tracker.update_and_check_persistence(
             current_time, target_ratio, min_vol, 2.5
         )
 
-        if not trade_side:
+        if not trade_side or not is_transition:
             return
 
         buy_vol, sell_vol, ratio = state.taker_ofi_tracker.get_metrics()
 
         if persistence_count == 1:
-            if is_new_candidate:
-                logger.info(f"[{asset_symbol}] TAKER OFI CANDIDATE! ({trade_side} | Ratio: {ratio:.2f}x) Persistence: {persistence_count}/2. Awaiting 2.5s confirmation...")
+            logger.info(f"[{asset_symbol}] TAKER OFI CANDIDATE! ({trade_side} | Ratio: {ratio:.2f}x) Persistence: {persistence_count}/2. Awaiting 2.5s confirmation...")
             return
         elif persistence_count < 2:
             return
