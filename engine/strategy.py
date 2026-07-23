@@ -122,6 +122,19 @@ class LiveTradingEngine:
                     state.positions.pop(contract_id, None)
             self.state_sequence += 1
 
+            # Inline Peak-to-Trough Drawdown check (Sub-millisecond latency gate)
+            est_portfolio_val = self.available_balance + self.capital_in_flight
+            if est_portfolio_val > self.peak_balance:
+                self.peak_balance = est_portfolio_val
+            
+            if self.peak_balance > 0:
+                drawdown = (self.peak_balance - est_portfolio_val) / self.peak_balance
+                if drawdown >= config.DRAWDOWN_LIMIT_PCT:
+                    logger.critical(
+                        f"[INLINE RISK MONITOR] DRAWDOWN LIMIT REACHED ({drawdown*100:.1f}% from peak ${self.peak_balance:.2f} → est. portfolio value ${est_portfolio_val:.2f}). Halting operations."
+                    )
+                    self.shutting_down = True
+
     def _get_filled_qty_from_details(self, details: dict, requested_qty: int) -> int:
         try:
             exec_fill = safe_decimal(details.get("executed_count"), "0.00")
@@ -174,10 +187,108 @@ class LiveTradingEngine:
         current_time = time.time()
         for symbol, state in self.assets.items():
             state.cooldown_until = current_time + 15.0
-            state.bids.clear()
-            state.asks.clear()
+            if hasattr(state, "bids") and isinstance(state.bids, dict):
+                state.bids.clear()
+            if hasattr(state, "asks") and isinstance(state.asks, dict):
+                state.asks.clear()
         if queue:
             safe_drain_queue(queue)
+
+    def _validate_orderbook_entry(self, asset_symbol: str, state: AssetState, trade_side: str, best_vals: Tuple[Decimal, Decimal, int, int], signal_tag: Optional[str] = None, is_mean_reversion_post: bool = False) -> Optional[Decimal]:
+        best_bid, best_ask, bid_depth, ask_depth = best_vals
+        if best_ask.is_nan() or best_bid.is_nan():
+            if signal_tag is None:
+                logger.warning(f"[{asset_symbol}] Orderbook rejected: NaN price detected in quotes (Bid: {best_bid}, Ask: {best_ask}).")
+            return None
+        
+        spread = best_ask - best_bid
+        max_spread = min(config.MAX_ALLOWED_SPREAD, max(Decimal("0.05"), best_bid * Decimal("0.30")))
+        max_entry_price = config.MAX_ENTRY_PRICE_YES if trade_side == "YES" else config.MAX_ENTRY_PRICE_NO
+
+        rejection_reason = None
+        if best_ask > max_entry_price:
+            rejection_reason = f"Ask ${best_ask:.2f} exceeds {trade_side} MAX_ENTRY_PRICE (${max_entry_price:.2f})"
+        elif best_ask < Decimal("0.15"):
+            rejection_reason = f"Ask ${best_ask:.2f} is below minimum price floor ($0.15)"
+        elif best_bid < Decimal("0.01"):
+            rejection_reason = f"Bid ${best_bid:.2f} is below minimum bid floor ($0.01)"
+        elif best_ask < best_bid:
+            rejection_reason = f"Crossed orderbook detected (Bid ${best_bid:.4f} > Ask ${best_ask:.4f})"
+        elif spread > max_spread:
+            rejection_reason = f"Spread ${spread:.4f} exceeds max_spread (${max_spread:.4f})"
+
+        if rejection_reason:
+            if signal_tag:
+                logger.warning(f"[{asset_symbol}] [{signal_tag}] Orderbook rejected: {rejection_reason} (Bid: ${best_bid:.4f}, Ask: ${best_ask:.4f}).")
+            else:
+                logger.warning(f"[{asset_symbol}] Orderbook rejected: {rejection_reason} (Bid: ${best_bid:.4f}, Ask: ${best_ask:.4f}).")
+            return None
+
+        limit_price = max(Decimal("0.01"), min(Decimal("0.99"), best_ask))
+
+        if state.strike_price and state.last_price:
+            spot_price = Decimal(str(state.last_price))
+            strike_price = Decimal(str(state.strike_price))
+            mean, upper, lower = state.fast_indicators.get_bollinger_bands()
+            std_dev = (upper - mean) / 2.0
+            floor_pct = config.STD_DEV_FLOORS_PCT.get(asset_symbol, 0.0005)
+            floor = floor_pct * float(state.last_price)
+            std_dev_dec = Decimal(str(max(std_dev, floor)))
+
+            if trade_side == "YES":
+                if spot_price < strike_price:
+                    distance = strike_price - spot_price
+                    if not is_mean_reversion_post and distance > Decimal("1.5") * std_dev_dec:
+                        if signal_tag:
+                            logger.info(f"[{asset_symbol}] [{signal_tag}] Drop: YES trade blocked. Spot ${spot_price} is too far below Strike ${strike_price}.")
+                        else:
+                            logger.info(f"[{asset_symbol}] Drop: YES trade blocked. Spot ${spot_price} is too far below Strike ${strike_price} (Dist: {distance:.2f} > 1.5 * StdDev: {Decimal('1.5') * std_dev_dec:.2f}).")
+                        return None
+            elif trade_side == "NO":
+                if spot_price > strike_price:
+                    distance = spot_price - strike_price
+                    if not is_mean_reversion_post and distance > Decimal("1.5") * std_dev_dec:
+                        if signal_tag:
+                            logger.info(f"[{asset_symbol}] [{signal_tag}] Drop: NO trade blocked. Spot ${spot_price} is too far above Strike ${strike_price}.")
+                        else:
+                            logger.info(f"[{asset_symbol}] Drop: NO trade blocked. Spot ${spot_price} is too far above Strike ${strike_price} (Dist: {distance:.2f} > 1.5 * StdDev: {Decimal('1.5') * std_dev_dec:.2f}).")
+                        return None
+
+        return limit_price
+
+    async def _acquire_execution_slot(self, state: AssetState, executing_contract_id: str, trade_side: str, limit_price: Decimal, current_time: float) -> Optional[Tuple[int, Decimal, bool]]:
+        async with self.balance_lock:
+            if executing_contract_id == getattr(state, "last_traded_event", ""):
+                return None
+            current_pos_side = state.position_sides.get(executing_contract_id)
+            if current_pos_side and current_pos_side != trade_side:
+                return None
+            
+            actual_pos_size = state.positions.get(executing_contract_id, 0)
+            remaining_exposure = config.MAX_EXPOSURE_PER_EVENT - actual_pos_size
+            if remaining_exposure <= 0:
+                return None
+            
+            trade_budget = self.available_balance * config.TRADE_BUDGET_PCT
+            raw_quantity = int(trade_budget / limit_price)
+            quantity = min(raw_quantity, config.MAX_CONTRACTS_PER_TRADE, remaining_exposure)
+            
+            if quantity < 30:
+                return None
+            
+            total_cost = Decimal(quantity) * limit_price
+            if self.available_balance >= total_cost:
+                self.available_balance -= total_cost
+                self.capital_in_flight += total_cost
+                
+                state.position_sides[executing_contract_id] = trade_side
+                state.positions[executing_contract_id] = actual_pos_size + quantity
+                state.last_traded_event = executing_contract_id
+                state.cooldown_until = current_time + 15.0
+                self.state_sequence += 1
+                return quantity, total_cost, True
+            else:
+                return None
 
     async def sync_balance_loop(self):
         try:
@@ -295,23 +406,32 @@ class LiveTradingEngine:
             await asyncio.sleep(backoff)
 
     async def sync_markets_loop(self):
+        attempt = 0
         while not self.shutting_down:
-            for symbol, state in self.assets.items():
-                last_price = getattr(state, 'last_price', None)
-                if not last_price: continue
-                    
-                contract_id, strike, exp_time = await self.broker.get_active_market(symbol, last_price)
-                if contract_id:
-                    if state.active_contract_id != contract_id:
-                        logger.debug(f"[MARKET ROUTER] {symbol} Locked onto valid contract: {contract_id}")
-                        state.active_contract_id = contract_id
-                    if strike > 0.0:
-                        state.strike_price = strike
-                    if exp_time > 0.0:
-                        state.expiration_time = exp_time 
-            await asyncio.sleep(30)
+            try:
+                for symbol, state in self.assets.items():
+                    last_price = getattr(state, 'last_price', None)
+                    if not last_price: continue
+                        
+                    contract_id, strike, exp_time = await self.broker.get_active_market(symbol, last_price)
+                    if contract_id:
+                        if state.active_contract_id != contract_id:
+                            logger.debug(f"[MARKET ROUTER] {symbol} Locked onto valid contract: {contract_id}")
+                            state.active_contract_id = contract_id
+                        if strike > 0.0:
+                            state.strike_price = strike
+                        if exp_time > 0.0:
+                            state.expiration_time = exp_time 
+                attempt = 0
+                await asyncio.sleep(30)
+            except Exception as e:
+                attempt += 1
+                delay = min(60.0, calculate_backoff_delay(attempt, base=2.0))
+                logger.error(f"[MARKET ROUTER] Error in sync_markets_loop: {type(e).__name__} - {sanitize_log_str(str(e))}. Retrying in {delay:.2f}s...")
+                await asyncio.sleep(delay)
 
     async def sync_macro_calendar_loop(self):
+        attempt = 0
         while not self.shutting_down:
             if os.environ.get("BOT_ENV", "simulation").lower() == "simulation":
                 await asyncio.sleep(3600)
@@ -330,6 +450,7 @@ class LiveTradingEngine:
 
                 if success:
                     logger.debug(f"[CIRCUIT BREAKER] Economic calendar synchronized.")
+                    attempt = 0
                 else:
                     logger.warning("[CIRCUIT BREAKER] Calendar synchronization returned no updates or failed validation.")
             except Exception as e:
@@ -338,64 +459,80 @@ class LiveTradingEngine:
             if success:
                 await asyncio.sleep(21600)
             else:
-                await asyncio.sleep(60)
+                attempt += 1
+                delay = min(300.0, calculate_backoff_delay(attempt, base=5.0))
+                logger.warning(f"[CIRCUIT BREAKER] Calendar sync failed. Retrying in {delay:.2f}s...")
+                await asyncio.sleep(delay)
 
     async def sync_macro_trend_loop(self):
         """Fetches the 4-hour trend for major assets using Coinbase REST API."""
-        resolver = SafeResolver()
-        connector = aiohttp.TCPConnector(ssl=GLOBAL_SSL_CONTEXT, resolver=resolver)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            while not self.shutting_down:
-                try:
-                    for asset in ["BTC-USD", "SOL-USD", "ETH-USD", "DOGE-USD"]:
+        attempt = 0
+        while not self.shutting_down:
+            try:
+                resolver = SafeResolver()
+                connector = aiohttp.TCPConnector(ssl=GLOBAL_SSL_CONTEXT, resolver=resolver)
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    while not self.shutting_down:
                         try:
-                            url = f"https://api.exchange.coinbase.com/products/{asset}/candles?granularity=3600"
-                            if not await is_safe_destination_async(url): continue
+                            for asset in ["BTC-USD", "SOL-USD", "ETH-USD", "DOGE-USD"]:
+                                try:
+                                    url = f"https://api.exchange.coinbase.com/products/{asset}/candles?granularity=3600"
+                                    if not await is_safe_destination_async(url): continue
+                                    
+                                    headers = {"User-Agent": "KalshiQuantEngine/1.0", "Accept": "application/json"}
+                                    timeout = aiohttp.ClientTimeout(total=5.0)
+                                    async with session.get(url, headers=headers, timeout=timeout, allow_redirects=False) as response:
+                                        if response.status == 200:
+                                            body_bytes = await response.content.read(524288)
+                                            if not body_bytes: continue
+                                            data = orjson.loads(body_bytes)
+                                            if len(data) >= 4:
+                                                current_close = float(data[0][4])
+                                                old_open = float(data[3][3])
+                                                if current_close > old_open * 1.002:
+                                                    self.macro_trend[asset] = "UP"
+                                                elif current_close < old_open * 0.998:
+                                                    self.macro_trend[asset] = "DOWN"
+                                                else:
+                                                    self.macro_trend[asset] = "FLAT"
+                                except Exception as e:
+                                    logger.debug(f"[{asset}] Macro sync internal error: {type(e).__name__}")
                             
-                            headers = {"User-Agent": "KalshiQuantEngine/1.0", "Accept": "application/json"}
-                            timeout = aiohttp.ClientTimeout(total=5.0)
-                            async with session.get(url, headers=headers, timeout=timeout, allow_redirects=False) as response:
-                                if response.status == 200:
-                                    body_bytes = await response.content.read(524288)
-                                    if not body_bytes: continue
-                                    data = orjson.loads(body_bytes)
-                                    if len(data) >= 4:
-                                        current_close = float(data[0][4])
-                                        old_open = float(data[3][3])
-                                        if current_close > old_open * 1.002:
-                                            self.macro_trend[asset] = "UP"
-                                        elif current_close < old_open * 0.998:
-                                            self.macro_trend[asset] = "DOWN"
-                                        else:
-                                            self.macro_trend[asset] = "FLAT"
-                        except Exception as e:
-                            logger.debug(f"[{asset}] Macro sync internal error: {type(e).__name__}")
-                    
-                    try:
-                        url = "https://fapi.binance.com/fapi/v1/klines?symbol=HYPEUSDT&interval=1h&limit=4"
-                        if await is_safe_destination_async(url):
-                            headers = {"User-Agent": "KalshiQuantEngine/1.0", "Accept": "application/json"}
-                            timeout = aiohttp.ClientTimeout(total=5.0)
-                            async with session.get(url, headers=headers, timeout=timeout, allow_redirects=False) as response:
-                                if response.status == 200:
-                                    body_bytes = await response.content.read(524288)
-                                    if not body_bytes: pass
-                                    else:
-                                        data = orjson.loads(body_bytes)
-                                        if len(data) >= 4:
-                                            current_close = float(data[-1][4])
-                                            old_open = float(data[0][1])
-                                            if current_close > old_open * 1.002:
-                                                self.macro_trend["HYPE-USD"] = "UP"
-                                            elif current_close < old_open * 0.998:
-                                                self.macro_trend["HYPE-USD"] = "DOWN"
+                            try:
+                                url = "https://fapi.binance.com/fapi/v1/klines?symbol=HYPEUSDT&interval=1h&limit=4"
+                                if await is_safe_destination_async(url):
+                                    headers = {"User-Agent": "KalshiQuantEngine/1.0", "Accept": "application/json"}
+                                    timeout = aiohttp.ClientTimeout(total=5.0)
+                                    async with session.get(url, headers=headers, timeout=timeout, allow_redirects=False) as response:
+                                        if response.status == 200:
+                                            body_bytes = await response.content.read(524288)
+                                            if not body_bytes: pass
                                             else:
-                                                self.macro_trend["HYPE-USD"] = "FLAT"
-                    except Exception as e:
-                        logger.debug(f"[HYPE-USD] Macro sync internal error: {type(e).__name__}")
-                except Exception as loop_e:
-                    logger.error(f"Macro trend loop error: {type(loop_e).__name__}")
-                await asyncio.sleep(1800)
+                                                data = orjson.loads(body_bytes)
+                                                if len(data) >= 4:
+                                                    current_close = float(data[-1][4])
+                                                    old_open = float(data[0][1])
+                                                    if current_close > old_open * 1.002:
+                                                        self.macro_trend["HYPE-USD"] = "UP"
+                                                    elif current_close < old_open * 0.998:
+                                                        self.macro_trend["HYPE-USD"] = "DOWN"
+                                                    else:
+                                                        self.macro_trend["HYPE-USD"] = "FLAT"
+                            except Exception as e:
+                                logger.debug(f"[HYPE-USD] Macro sync internal error: {type(e).__name__}")
+                            
+                            attempt = 0
+                            await asyncio.sleep(1800)
+                        except Exception as inner_e:
+                            logger.error(f"Macro trend loop internal pass error: {type(inner_e).__name__}")
+                            attempt += 1
+                            delay = min(300.0, calculate_backoff_delay(attempt, base=10.0))
+                            await asyncio.sleep(delay)
+            except Exception as outer_e:
+                logger.error(f"Macro trend session management failure: {type(outer_e).__name__}")
+                attempt += 1
+                delay = min(300.0, calculate_backoff_delay(attempt, base=10.0))
+                await asyncio.sleep(delay)
 
     async def _monitor_take_profit(self, state: AssetState, contract_id: str, side: str, entry_price: Decimal, quantity: int, seconds_left: float, hold_to_settle: bool = False, strike_price: Optional[float] = None):
         """Asynchronous O(1) Background Task: Laddered Take-Profit with adaptive pricing."""
@@ -576,7 +713,7 @@ class LiveTradingEngine:
                 
                 poll_interval = 5.0
                 elapsed = 0.0
-                timeout = max(0.0, seconds_left - 10.0)
+                timeout = max(0.0, seconds_left - 20.0)
                 
                 for oid, _, _, _ in order_ids:
                     last_reported_fill[oid] = 0
@@ -668,9 +805,11 @@ class LiveTradingEngine:
                     self.active_tp_orders.pop(oid, None)
             
             logger.info(f"[{contract_id}] Take-Profit lifecycle ending. Cancelling remaining orders...")
-            for oid, oqty, oprice, olabel in order_ids:
+            
+            async def cancel_and_reconcile_single(oid, oqty, oprice, olabel):
+                nonlocal total_filled, total_proceeds
                 if oid in completed_orders:
-                    continue
+                    return
                 try:
                     for c_attempt in range(3):
                         try:
@@ -707,6 +846,13 @@ class LiveTradingEngine:
                         await asyncio.sleep(backoff_delay)
                 except Exception as ve:
                     logger.warning(f"[{contract_id}] Error verifying final details for {olabel} TP: {ve}")
+
+            reconcile_tasks = [
+                cancel_and_reconcile_single(oid, oqty, oprice, olabel)
+                for oid, oqty, oprice, olabel in order_ids
+            ]
+            if reconcile_tasks:
+                await asyncio.gather(*reconcile_tasks)
             
             current_hour = int(datetime.datetime.now(datetime.timezone.utc).hour)
             total_cost = Decimal(quantity) * entry_price
@@ -733,8 +879,8 @@ class LiveTradingEngine:
                                 settled_won = last_price_dec > strike_price_dec
                             else:
                                 settled_won = last_price_dec <= strike_price_dec
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.warning(f"[{contract_id}] Error calculating target strike settlement: {e}")
                 
                 if settled_won is True:
                     settlement_proceeds = Decimal(str(unfilled_at_settlement)) * Decimal("1.00")
@@ -766,35 +912,44 @@ class LiveTradingEngine:
         finally:
             async def run_cleanup():
                 nonlocal total_filled, total_proceeds
-                for oid, oqty, oprice, olabel in order_ids:
-                    if oid not in completed_orders:
+                async def cancel_and_reconcile_cleanup(oid, oqty, oprice, olabel):
+                    if oid in completed_orders:
+                        return
+                    try:
+                        logger.warning(f"[{contract_id}] Take-Profit task interrupted or ended with dangling orders. Cancelling {oid} ({olabel}) on exchange.")
+                        await self.broker.cancel_order(oid)
                         try:
-                            logger.warning(f"[{contract_id}] Take-Profit task interrupted or ended with dangling orders. Cancelling {oid} ({olabel}) on exchange.")
-                            await self.broker.cancel_order(oid)
-                            
-                            try:
-                                details = await self.broker.get_order_details(oid, simulate=False)
-                                filled = self._get_filled_qty_from_details(details, oqty)
-                                accumulated_fills[oid] = max(accumulated_fills.get(oid, 0), filled)
-                                new_fills = accumulated_fills[oid] - last_reported_fill.get(oid, 0)
-                                if new_fills > 0:
-                                    total_filled += new_fills
-                                    total_proceeds += Decimal(new_fills) * oprice
-                                    await self._update_local_state(Decimal(new_fills) * oprice, Decimal("0.00"), state, contract_id, -new_fills)
-                                    last_reported_fill[oid] = accumulated_fills[oid]
-                                    logger.info(f"[{contract_id}] TP partial fill reconciled during cleanup: {filled}/{oqty}")
-                            except Exception as ex:
-                                logger.warning(f"[{contract_id}] Failed to reconcile order details during cancellation: {ex}")
-                            
-                            completed_orders.add(oid)
-                        except Exception as ce:
-                            logger.error(f"[{contract_id}] Failed to cancel order {oid} during TP cleanup: {ce}")
+                            details = await self.broker.get_order_details(oid, simulate=False)
+                            filled = self._get_filled_qty_from_details(details, oqty)
+                            accumulated_fills[oid] = max(accumulated_fills.get(oid, 0), filled)
+                            new_fills = accumulated_fills[oid] - last_reported_fill.get(oid, 0)
+                            if new_fills > 0:
+                                total_filled += new_fills
+                                total_proceeds += Decimal(new_fills) * oprice
+                                await self._update_local_state(Decimal(new_fills) * oprice, Decimal("0.00"), state, contract_id, -new_fills)
+                                last_reported_fill[oid] = accumulated_fills[oid]
+                                logger.info(f"[{contract_id}] TP partial fill reconciled during cleanup: {filled}/{oqty}")
+                        except Exception as ex:
+                            logger.warning(f"[{contract_id}] Failed to reconcile order details during cancellation: {ex}")
+                        completed_orders.add(oid)
+                    except Exception as ce:
+                        logger.error(f"[{contract_id}] Failed to cancel order {oid} during TP cleanup: {ce}")
+
+                cleanup_tasks = [
+                    cancel_and_reconcile_cleanup(oid, oqty, oprice, olabel)
+                    for oid, oqty, oprice, olabel in order_ids
+                ]
+                if cleanup_tasks:
+                    await asyncio.gather(*cleanup_tasks)
                             
                 unfilled = quantity - total_filled
                 if unfilled > 0:
                     if hasattr(self.broker, 'positions') and isinstance(self.broker.positions, dict):
                         self.broker.positions.pop((contract_id, side.lower()), None)
-                    await self._update_local_state(Decimal("0.00"), Decimal("0.00"), state, contract_id, -unfilled)
+                    # Only apply local position clearance if we are in paper-trading/simulation mode.
+                    # In live trading, let the sync loop naturally reconcile the settled state.
+                    if getattr(self.broker, 'paper_trade', False) or hasattr(self.broker, 'simulated_balance'):
+                        await self._update_local_state(Decimal("0.00"), Decimal("0.00"), state, contract_id, -unfilled)
 
             await self._safe_shield(run_cleanup())
 
@@ -1200,6 +1355,9 @@ class LiveTradingEngine:
             if self.circuit_breaker.is_locked_out():
                 return
 
+            if getattr(self.broker, "rate_limited_until", 0.0) > time.time():
+                return
+
             if self.last_sync_time == 0.0 or time.time() - self.last_sync_time > config.STALE_BALANCE_TIMEOUT_SEC: 
                 logger.warning(f"[{asset_symbol}] Dropping liquidation event — balance data is stale.")
                 return
@@ -1267,96 +1425,20 @@ class LiveTradingEngine:
                 
                 if executing_contract_id != state.active_contract_id:
                     return
-                    
-                best_bid, best_ask, bid_depth, ask_depth = best_vals
-                if best_ask.is_nan() or best_bid.is_nan():
-                    logger.warning(f"[{asset_symbol}] Orderbook rejected: NaN price detected in quotes (Bid: {best_bid}, Ask: {best_ask}).")
+
+                limit_price = self._validate_orderbook_entry(
+                    asset_symbol, state, trade_side, best_vals,
+                    signal_tag=None, is_mean_reversion_post=is_mean_reversion_post
+                )
+                if limit_price is None:
                     return
-                spread = best_ask - best_bid
-                
-                max_spread = min(config.MAX_ALLOWED_SPREAD, max(Decimal("0.05"), best_bid * Decimal("0.30")))
-                max_entry_price = config.MAX_ENTRY_PRICE_YES if trade_side == "YES" else config.MAX_ENTRY_PRICE_NO
-                
-                rejection_reason = None
-                if best_ask > max_entry_price:
-                    rejection_reason = f"Ask ${best_ask:.2f} exceeds {trade_side} MAX_ENTRY_PRICE (${max_entry_price:.2f})"
-                elif best_ask < Decimal("0.15"):
-                    rejection_reason = f"Ask ${best_ask:.2f} is below minimum price floor ($0.15)"
-                elif best_bid < Decimal("0.01"):
-                    rejection_reason = f"Bid ${best_bid:.2f} is below minimum bid floor ($0.01)"
-                elif best_ask < best_bid:
-                    rejection_reason = f"Crossed orderbook detected (Bid ${best_bid:.4f} > Ask ${best_ask:.4f})"
-                elif spread > max_spread:
-                    rejection_reason = f"Spread ${spread:.4f} exceeds max_spread (${max_spread:.4f})"
-                    
-                if rejection_reason:
-                    logger.warning(f"[{asset_symbol}] Orderbook rejected: {rejection_reason} (Bid: ${best_bid:.4f}, Ask: ${best_ask:.4f}).")
+
+                slot_res = await self._acquire_execution_slot(state, executing_contract_id, trade_side, limit_price, current_time)
+                if not slot_res:
                     return
-                    
-                limit_price = max(Decimal("0.01"), min(Decimal("0.99"), best_ask))
+                quantity, total_cost, local_mutated = slot_res
                 
-                if state.strike_price and state.last_price:
-                    spot_price = Decimal(str(state.last_price))
-                    strike_price = Decimal(str(state.strike_price))
-                    
-                    mean, upper, lower = state.fast_indicators.get_bollinger_bands()
-                    std_dev = (upper - mean) / 2.0
-                    floor_pct = config.STD_DEV_FLOORS_PCT.get(asset_symbol, 0.0005)
-                    floor = floor_pct * float(state.last_price)
-                    std_dev_dec = Decimal(str(max(std_dev, floor)))
-                    
-                    if trade_side == "YES":
-                        if spot_price < strike_price:
-                            distance = strike_price - spot_price
-                            if not is_mean_reversion_post and distance > Decimal("1.5") * std_dev_dec:
-                                logger.info(f"[{asset_symbol}] Drop: YES trade blocked. Spot ${spot_price} is too far below Strike ${strike_price} (Dist: {distance:.2f} > 1.5 * StdDev: {Decimal('1.5') * std_dev_dec:.2f}).")
-                                return
-                    elif trade_side == "NO":
-                        if spot_price > strike_price:
-                            distance = spot_price - strike_price
-                            if not is_mean_reversion_post and distance > Decimal("1.5") * std_dev_dec:
-                                logger.info(f"[{asset_symbol}] Drop: NO trade blocked. Spot ${spot_price} is too far above Strike ${strike_price} (Dist: {distance:.2f} > 1.5 * StdDev: {Decimal('1.5') * std_dev_dec:.2f}).")
-                                return
-                
-                should_decrement = False
-                async with self.balance_lock:
-                    if executing_contract_id == getattr(state, "last_traded_event", ""):
-                        should_decrement = True
-                    else:
-                        current_pos_side = state.position_sides.get(executing_contract_id)
-                        if current_pos_side and current_pos_side != trade_side:
-                            should_decrement = True
-                        else:
-                            actual_pos_size = state.positions.get(executing_contract_id, 0)
-                            remaining_exposure = config.MAX_EXPOSURE_PER_EVENT - actual_pos_size
-                            if remaining_exposure <= 0:
-                                should_decrement = True
-                            else:
-                                trade_budget = self.available_balance * config.TRADE_BUDGET_PCT
-                                raw_quantity = int(trade_budget / limit_price)
-                                quantity = min(raw_quantity, config.MAX_CONTRACTS_PER_TRADE, remaining_exposure)
-                                
-                                if quantity < 30:
-                                    should_decrement = True
-                                else:
-                                    total_cost = Decimal(quantity) * limit_price
-                                    if self.available_balance >= total_cost:
-                                        self.available_balance -= total_cost
-                                        self.capital_in_flight += total_cost
-                                        
-                                        state.position_sides[executing_contract_id] = trade_side
-                                        state.positions[executing_contract_id] = actual_pos_size + quantity
-                                        state.last_traded_event = executing_contract_id
-                                        state.cooldown_until = current_time + 15.0
-                                        self.state_sequence += 1
-                                        local_mutated = True
-                                    else:
-                                        should_decrement = True
-                
-                if should_decrement:
-                    return
-                
-                logger.warning(f"[{asset_symbol}] BINANCE LIQUIDATION SIGNAL (${notional:,.2f})! Ask: ${best_ask:.2f} | Sniping {quantity} contracts.")
+                logger.warning(f"[{asset_symbol}] BINANCE LIQUIDATION SIGNAL (${notional:,.2f})! Ask: ${best_vals[1]:.2f} | Sniping {quantity} contracts.")
                 
                 exec_task = asyncio.create_task(
                     self.execute_and_hold_entry(
@@ -1389,7 +1471,7 @@ class LiveTradingEngine:
     async def _evaluate_index_lag_entry(self, asset_symbol: str, state: AssetState, current_time: float):
         if self.shutting_down or not state.active_contract_id or current_time < state.cooldown_until:
             return
-        if current_time - getattr(state, "last_signal_time", 0.0) < 2.0:
+        if current_time - getattr(state, "last_signal_time", 0.0) < float(config.SIGNAL_EVAL_THROTTLE_SECS):
             return
         if self.circuit_breaker.is_locked_out():
             return
@@ -1423,7 +1505,7 @@ class LiveTradingEngine:
     async def _evaluate_ofi_entry(self, asset_symbol: str, state: AssetState, current_time: float):
         if self.shutting_down or not state.active_contract_id or current_time < state.cooldown_until:
             return
-        if current_time - getattr(state, "last_signal_time", 0.0) < 2.0:
+        if current_time - getattr(state, "last_signal_time", 0.0) < float(config.SIGNAL_EVAL_THROTTLE_SECS):
             return
         if self.circuit_breaker.is_locked_out():
             return
@@ -1499,6 +1581,9 @@ class LiveTradingEngine:
             if self.circuit_breaker.is_locked_out():
                 return
 
+            if getattr(self.broker, "rate_limited_until", 0.0) > time.time():
+                return
+
             current_time = time.time()
             sec_left_now = state.expiration_time - current_time if state.expiration_time else 720.0
             if sec_left_now < 90.0 or sec_left_now > 480.0:
@@ -1507,89 +1592,19 @@ class LiveTradingEngine:
             if executing_contract_id != state.active_contract_id:
                 return
 
-            best_bid, best_ask, bid_depth, ask_depth = best_vals
-            if best_ask.is_nan() or best_bid.is_nan():
-                return
-            spread = best_ask - best_bid
-
-            max_spread = min(config.MAX_ALLOWED_SPREAD, max(Decimal("0.05"), best_bid * Decimal("0.30")))
-            max_entry_price = config.MAX_ENTRY_PRICE_YES if trade_side == "YES" else config.MAX_ENTRY_PRICE_NO
-
-            rejection_reason = None
-            if best_ask > max_entry_price:
-                rejection_reason = f"Ask ${best_ask:.2f} exceeds {trade_side} MAX_ENTRY_PRICE (${max_entry_price:.2f})"
-            elif best_ask < Decimal("0.15"):
-                rejection_reason = f"Ask ${best_ask:.2f} is below minimum price floor ($0.15)"
-            elif best_bid < Decimal("0.01"):
-                rejection_reason = f"Bid ${best_bid:.2f} is below minimum bid floor ($0.01)"
-            elif best_ask < best_bid:
-                rejection_reason = f"Crossed orderbook detected (Bid ${best_bid:.4f} > Ask ${best_ask:.4f})"
-            elif spread > max_spread:
-                rejection_reason = f"Spread ${spread:.4f} exceeds max_spread (${max_spread:.4f})"
-
-            if rejection_reason:
-                logger.warning(f"[{asset_symbol}] [{signal_tag}] Orderbook rejected: {rejection_reason} (Bid: ${best_bid:.4f}, Ask: ${best_ask:.4f}).")
+            limit_price = self._validate_orderbook_entry(
+                asset_symbol, state, trade_side, best_vals,
+                signal_tag=signal_tag, is_mean_reversion_post=False
+            )
+            if limit_price is None:
                 return
 
-            limit_price = max(Decimal("0.01"), min(Decimal("0.99"), best_ask))
-
-            if state.strike_price and state.last_price:
-                spot_price = Decimal(str(state.last_price))
-                strike_price = Decimal(str(state.strike_price))
-                mean, upper, lower = state.fast_indicators.get_bollinger_bands()
-                std_dev = (upper - mean) / 2.0
-                floor_pct = config.STD_DEV_FLOORS_PCT.get(asset_symbol, 0.0005)
-                floor = floor_pct * float(state.last_price)
-                std_dev_dec = Decimal(str(max(std_dev, floor)))
-
-                if trade_side == "YES" and spot_price < strike_price:
-                    distance = strike_price - spot_price
-                    if distance > Decimal("1.5") * std_dev_dec:
-                        logger.info(f"[{asset_symbol}] [{signal_tag}] Drop: YES trade blocked. Spot ${spot_price} is too far below Strike ${strike_price}.")
-                        return
-                elif trade_side == "NO" and spot_price > strike_price:
-                    distance = spot_price - strike_price
-                    if distance > Decimal("1.5") * std_dev_dec:
-                        logger.info(f"[{asset_symbol}] [{signal_tag}] Drop: NO trade blocked. Spot ${spot_price} is too far above Strike ${strike_price}.")
-                        return
-
-            should_decrement = False
-            async with self.balance_lock:
-                if executing_contract_id == getattr(state, "last_traded_event", ""):
-                    should_decrement = True
-                else:
-                    current_pos_side = state.position_sides.get(executing_contract_id)
-                    if current_pos_side and current_pos_side != trade_side:
-                        should_decrement = True
-                    else:
-                        actual_pos_size = state.positions.get(executing_contract_id, 0)
-                        remaining_exposure = config.MAX_EXPOSURE_PER_EVENT - actual_pos_size
-                        if remaining_exposure <= 0:
-                            should_decrement = True
-                        else:
-                            trade_budget = self.available_balance * config.TRADE_BUDGET_PCT
-                            raw_quantity = int(trade_budget / limit_price)
-                            quantity = min(raw_quantity, config.MAX_CONTRACTS_PER_TRADE, remaining_exposure)
-                            if quantity < 30:
-                                should_decrement = True
-                            else:
-                                total_cost = Decimal(quantity) * limit_price
-                                if self.available_balance >= total_cost:
-                                    self.available_balance -= total_cost
-                                    self.capital_in_flight += total_cost
-                                    state.position_sides[executing_contract_id] = trade_side
-                                    state.positions[executing_contract_id] = actual_pos_size + quantity
-                                    state.last_traded_event = executing_contract_id
-                                    state.cooldown_until = current_time + 15.0
-                                    self.state_sequence += 1
-                                    local_mutated = True
-                                else:
-                                    should_decrement = True
-
-            if should_decrement:
+            slot_res = await self._acquire_execution_slot(state, executing_contract_id, trade_side, limit_price, current_time)
+            if not slot_res:
                 return
+            quantity, total_cost, local_mutated = slot_res
 
-            logger.warning(f"[{asset_symbol}] [{signal_tag}] SIGNAL EXECUTING! Ask: ${best_ask:.2f} | Sniping {quantity} contracts.")
+            logger.warning(f"[{asset_symbol}] [{signal_tag}] SIGNAL EXECUTING! Ask: ${best_vals[1]:.2f} | Sniping {quantity} contracts.")
             exec_task = asyncio.create_task(
                 self.execute_and_hold_entry(
                     state, executing_contract_id, trade_side, limit_price, quantity, total_cost, sec_left_now
@@ -1669,7 +1684,12 @@ async def market_worker_loop(engine: LiveTradingEngine, queue: asyncio.Queue):
         try:
             ingress_time, message = await asyncio.wait_for(queue.get(), timeout=1.0)
             try: 
-                if time.time() - ingress_time > 3.0:
+                now = time.time()
+                if now - ingress_time > 3.0:
+                    last_drop_log = getattr(engine, "_last_drop_log_tick_time", 0.0)
+                    if now - last_drop_log > 5.0:
+                        logger.warning(f"[LATENCY GATE] Dropping stale spot tick inside worker (delayed by {now - ingress_time:.2f}s)")
+                        engine._last_drop_log_tick_time = now
                     continue
                 await engine.process_live_tick(message)
             except Exception as e: logger.error("Tick fault", exc_info=True)

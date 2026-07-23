@@ -210,6 +210,12 @@ impl IndexLagTracker {
                 break;
             }
         }
+
+        if self.ticks.is_empty() {
+            self.sum_price = 0.0;
+        } else if self.ticks.len() % 128 == 0 {
+            self.sum_price = self.ticks.iter().map(|&(_, p)| p).sum();
+        }
     }
 
     pub fn get_average(&self) -> f64 {
@@ -288,6 +294,14 @@ impl TakerOrderFlowTracker {
             } else {
                 break;
             }
+        }
+
+        if self.trades.is_empty() {
+            self.total_buy_vol = 0.0;
+            self.total_sell_vol = 0.0;
+        } else if self.trades.len() % 128 == 0 {
+            self.total_buy_vol = self.trades.iter().filter(|&&(_, _, is_b)| is_b).map(|&(_, v, _)| v).sum();
+            self.total_sell_vol = self.trades.iter().filter(|&&(_, _, is_b)| !is_b).map(|&(_, v, _)| v).sum();
         }
     }
 

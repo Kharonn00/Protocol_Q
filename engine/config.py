@@ -59,6 +59,7 @@ class BotConfig:
     ENABLE_OFI_STRATEGY: bool = os.environ.get("ENABLE_OFI_STRATEGY", "true").lower() == "true"
     OFI_BUY_SELL_RATIO: Decimal = Decimal(os.environ.get("OFI_BUY_SELL_RATIO", "3.5"))
     OFI_MIN_VOLUME_NOTIONAL: Decimal = Decimal(os.environ.get("OFI_MIN_VOLUME_NOTIONAL", "50000.0"))
+    SIGNAL_EVAL_THROTTLE_SECS: float = float(os.environ.get("SIGNAL_EVAL_THROTTLE_SECS", "2.0"))
 
     def __post_init__(self):
         """SEC-06: Bounds-validate all environment-sourced config to prevent adversarial misconfiguration."""
@@ -82,6 +83,8 @@ class BotConfig:
             raise ValueError(f"OFI_BUY_SELL_RATIO={self.OFI_BUY_SELL_RATIO} out of safe range [1.5, 20.0]")
         if not (Decimal("1000.0") <= self.OFI_MIN_VOLUME_NOTIONAL <= Decimal("10000000.0")):
             raise ValueError(f"OFI_MIN_VOLUME_NOTIONAL={self.OFI_MIN_VOLUME_NOTIONAL} out of safe range [1000, 10000000]")
+        if not (0.1 <= self.SIGNAL_EVAL_THROTTLE_SECS <= 60.0):
+            raise ValueError(f"SIGNAL_EVAL_THROTTLE_SECS={self.SIGNAL_EVAL_THROTTLE_SECS} out of safe range [0.1, 60.0]")
         for asset, floor_val in self.STD_DEV_FLOORS_PCT.items():
             if not (0.0 <= floor_val <= 1.0):
                 raise ValueError(f"STD_DEV_FLOORS_PCT[{asset}]={floor_val} out of safe range [0.0, 1.0]")

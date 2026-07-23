@@ -56,6 +56,8 @@ if __name__ == "__main__":
             else:
                 logger.debug("Initializing PAPER TRADING Broker.")
                 broker = LiveKalshiBroker(key_id=key_id, private_key=private_key, paper_trade=True)
+            key_id = None
+            private_key = None
             del private_key
             del key_id
             gc.collect()

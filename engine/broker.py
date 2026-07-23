@@ -155,6 +155,7 @@ class LiveKalshiBroker(ExecutionBroker):
         self.timeout_short = aiohttp.ClientTimeout(total=float(os.environ.get("REST_TIMEOUT_SHORT", "0.75")))
         self.timeout_long = aiohttp.ClientTimeout(total=float(os.environ.get("REST_TIMEOUT_LONG", "1.5")))
         self.private_key = private_key
+        self.rate_limited_until: float = 0.0
 
     async def start(self):
         resolver = SafeResolver()
@@ -196,6 +197,8 @@ class LiveKalshiBroker(ExecutionBroker):
         return base64.b64encode(signature).decode('utf-8')
 
     async def get_balance(self) -> Optional[Tuple[Decimal, Decimal]]:
+        if self.rate_limited_until > time.time():
+            return None
         if self.paper_trade:
             return self._paper_balance, self._paper_balance
             
@@ -219,6 +222,8 @@ class LiveKalshiBroker(ExecutionBroker):
                     err_bytes = await response.content.read(1024)
                     err_text = err_bytes.decode('utf-8', errors='ignore')
                     logger.error(f"[API ERROR] Failed to fetch balance (HTTP {response.status}): {sanitize_log_str(err_text)[:250]}")
+                    if response.status == 429:
+                        self.rate_limited_until = time.time() + 60.0
                     return None
         except Exception as e:
             logger.error(f"[API] Error fetching balance: {type(e).__name__}", exc_info=True)
@@ -255,6 +260,8 @@ class LiveKalshiBroker(ExecutionBroker):
         return locked_capital
 
     async def get_positions(self) -> Optional[Dict[str, Tuple[int, str]]]:
+        if self.rate_limited_until > time.time():
+            return None
         if self.paper_trade:
             return None
             
@@ -292,12 +299,16 @@ class LiveKalshiBroker(ExecutionBroker):
                     err_bytes = await response.content.read(1024)
                     err_text = err_bytes.decode('utf-8', errors='ignore')
                     logger.error(f"[API ERROR] Failed to fetch positions (HTTP {response.status}): {sanitize_log_str(err_text)[:250]}")
+                    if response.status == 429:
+                        self.rate_limited_until = time.time() + 60.0
                     return None
         except Exception as e:
             logger.error(f"[API] Error fetching positions: {type(e).__name__}", exc_info=True)
             return None
 
     async def get_active_market(self, asset_symbol: str, current_price: float) -> Tuple[str, float, float]:
+        if self.rate_limited_until > time.time():
+            return "", 0.0, 0.0
         base_asset = asset_symbol.split('-')[0]
         series_ticker = f"KX{base_asset}15M"
         
@@ -317,6 +328,8 @@ class LiveKalshiBroker(ExecutionBroker):
                     err_bytes = await response.content.read(1024)
                     err_text = err_bytes.decode('utf-8', errors='ignore')
                     logger.error(f"[API ERROR] Failed to fetch active market (HTTP {response.status}): {sanitize_log_str(err_text)[:250]}")
+                    if response.status == 429:
+                        self.rate_limited_until = time.time() + 60.0
                     return "", 0.0, 0.0
                 data = await self._read_json(response, limit=1024 * 1024)
                 markets = data.get("markets", [])
@@ -389,6 +402,8 @@ class LiveKalshiBroker(ExecutionBroker):
             return "", 0.0, 0.0
 
     async def get_best_bid_ask(self, contract_id: str, side: str) -> Optional[Tuple[Decimal, Decimal, int, int]]:
+        if self.rate_limited_until > time.time():
+            return None
         safe_contract_id = urllib.parse.quote(contract_id, safe='')
         path = f"/markets/{safe_contract_id}/orderbook?depth=1"
         current_time_ms = str(int(time.time() * 1000))
@@ -435,11 +450,19 @@ class LiveKalshiBroker(ExecutionBroker):
                         return best_yes_bid, (Decimal("1.00") - best_no_bid), best_yes_qty, best_no_qty
                     else: 
                         return best_no_bid, (Decimal("1.00") - best_yes_bid), best_no_qty, best_yes_qty
+                else:
+                    if resp.status == 429:
+                        self.rate_limited_until = time.time() + 60.0
+                    return None
         except Exception as e: 
+            if hasattr(e, 'status') and getattr(e, 'status') == 429:
+                self.rate_limited_until = time.time() + 60.0
             logger.error("Orderbook fetch error", exc_info=True)
         return None
 
     async def get_order_details(self, order_id: str, simulate: bool = True, cached_best_vals=None, **kwargs) -> dict:
+        if not order_id.startswith("paper-") and self.rate_limited_until > time.time():
+            return {}
         if order_id.startswith("paper-"):
             async with self.paper_orders_lock:
                 order_data = self._paper_orders.get(order_id)
@@ -579,11 +602,18 @@ class LiveKalshiBroker(ExecutionBroker):
                 if resp.status == 200:
                     data = await self._read_json(resp)
                     return data.get("order", {})
+                else:
+                    if resp.status == 429:
+                        self.rate_limited_until = time.time() + 60.0
         except Exception as e: 
+            if hasattr(e, 'status') and getattr(e, 'status') == 429:
+                self.rate_limited_until = time.time() + 60.0
             logger.error(f"Error fetching order details for {order_id}", exc_info=True)
         return {}
 
     async def get_order_by_client_id(self, client_order_id: str) -> dict:
+        if self.rate_limited_until > time.time():
+            return {}
         safe_client_order_id = urllib.parse.quote(client_order_id, safe='')
         path = f"/portfolio/orders?client_order_id={safe_client_order_id}"
         current_time_ms = str(int(time.time() * 1000))
@@ -599,7 +629,12 @@ class LiveKalshiBroker(ExecutionBroker):
                     data = await self._read_json(resp)
                     orders = data.get("orders", [])
                     if orders: return orders[0] 
+                else:
+                    if resp.status == 429:
+                        self.rate_limited_until = time.time() + 60.0
         except Exception as e: 
+            if hasattr(e, 'status') and getattr(e, 'status') == 429:
+                self.rate_limited_until = time.time() + 60.0
             logger.error(f"Error fetching order by client ID {client_order_id[:20]}...", exc_info=True)  
         return {}
 
@@ -618,6 +653,9 @@ class LiveKalshiBroker(ExecutionBroker):
                     return True
                 return False
         
+        if self.rate_limited_until > time.time():
+            return False
+            
         safe_order_id = urllib.parse.quote(order_id, safe='')
         path = f"/portfolio/orders/{safe_order_id}"
         method = "DELETE"
@@ -630,8 +668,12 @@ class LiveKalshiBroker(ExecutionBroker):
         }
         try:
             async with self.session.delete(f"{self.base_url}{path}", headers=headers, timeout=self.timeout_short) as response:
+                if response.status == 429:
+                    self.rate_limited_until = time.time() + 60.0
                 return response.status in [200, 201]
         except Exception as e: 
+            if hasattr(e, 'status') and getattr(e, 'status') == 429:
+                self.rate_limited_until = time.time() + 60.0
             logger.error(f"Error cancelling order {order_id}", exc_info=True)
             return False
 
@@ -674,6 +716,9 @@ class LiveKalshiBroker(ExecutionBroker):
             logger.warning(f"[PAPER ORDER PLACED] {action.upper()} {quantity}x {contract_id} '{side.upper()}' @ ${limit_price:.2f}")
             return order_id
             
+        if self.rate_limited_until > time.time():
+            return None
+            
         path = "/portfolio/orders"
         method = "POST"
         current_time_ms = str(int(time.time() * 1000))
@@ -715,6 +760,8 @@ class LiveKalshiBroker(ExecutionBroker):
                     except Exception:
                         err_msg = "Could not parse JSON error response."
                     logger.error(f"[API ERROR] Trade rejected (HTTP {response.status}): {sanitize_log_str(str(err_msg))[:250]}")
+                    if response.status == 429:
+                        self.rate_limited_until = time.time() + 60.0
                     return None
         except Exception as e: 
             logger.error("Error executing trade", exc_info=True)
