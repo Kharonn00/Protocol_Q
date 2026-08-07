@@ -92,6 +92,8 @@ GEMINI.md
 *.md
 *.skill
 monte_carlo_test.py
+stress_simulation_test.py
+tick_replay_test.py
 
 # Folders
 scratch/

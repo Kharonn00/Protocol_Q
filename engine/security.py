@@ -1,3 +1,11 @@
+"""
+Kalshi Quantitative Trading Engine (KQTE) - Zero-Trust Security & Circuit Breaker
+
+Implements socket-level Server-Side Request Forgery (SSRF) defense (`SafeResolver`),
+DNS rebinding prevention, log injection sanitization (CWE-117), AWS Secret Manager
+retrieval with in-memory scrubbing, Macro Economic Circuit Breaker lockouts, and rate-limited HTTP health probes.
+"""
+
 import os
 import sys
 import time
@@ -30,6 +38,8 @@ def sanitize_log_str(val: str) -> str:
     val = val.replace('\n', '\\n').replace('\r', '\\r')
     return _ANSI_ESCAPE_RE.sub('', val)
 
+_ZERO_NET = ipaddress.IPv4Network('0.0.0.0/8')
+
 @lru_cache(maxsize=1024)
 def is_private_ip(ip_str: str) -> bool:
     """Optimized and cached private IP lookup to prevent connection overhead."""
@@ -38,6 +48,8 @@ def is_private_ip(ip_str: str) -> bool:
         # Unpack IPv4-mapped IPv6 addresses (e.g. ::ffff:127.0.0.1)
         if isinstance(ip_addr, ipaddress.IPv6Address) and ip_addr.ipv4_mapped is not None:
             ip_addr = ip_addr.ipv4_mapped
+        if ip_addr.version == 4 and ip_addr in _ZERO_NET:
+            return True
         return (
             ip_addr.is_private or 
             ip_addr.is_loopback or 

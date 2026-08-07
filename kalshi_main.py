@@ -13,6 +13,14 @@ from engine import (
     binance_worker_loop, get_kalshi_credentials, handle_health_check, log_exception_group
 )
 
+"""
+Kalshi Quantitative Trading Engine (KQTE) - Core Entry Point
+
+Orchestrates system startup, secret retrieval, 12-factor configuration,
+micro HTTP health monitoring, and asynchronous task lifecycle management.
+Uses Python 3.12+ TaskGroup for deterministic concurrent worker scheduling.
+"""
+
 # Optimize Garbage Collection thresholds to reduce latency jitter in high-frequency trading loops
 gc.set_threshold(7000, 10, 10)
 
@@ -20,6 +28,12 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(
 logger = logging.getLogger("KalshiQuantEngine")
 
 async def start_health_server() -> web.AppRunner:
+    """
+    Launches an ephemeral, non-blocking aiohttp health server for AWS ECS Fargate health probes.
+    
+    Returns:
+        web.AppRunner: Active web runner managing the /health endpoint.
+    """
     app = web.Application()
     app.router.add_get('/', handle_health_check)
     app.router.add_get('/health', handle_health_check)
@@ -33,15 +47,20 @@ async def start_health_server() -> web.AppRunner:
     logger.debug(f"[HEALTH SERVER] Micro HTTP health responder online, listening on port {port}")
     return runner
 
-# Lock all module-level imports, classes, and configurations into the permanent 
-# GC generation to prevent the garbage collector from scanning them during hot loops.
+# Lock all module-level imports, classes, and configurations into permanent 
+# GC generation 2 to prevent garbage collector pauses during execution.
+# WARNING: Do not instantiate mutable runtime objects above this line.
 gc.freeze()
 
 # ==========================================
-# BOOTSTRAPPER
+# BOOTSTRAPPER & EVENT LOOP ORCHESTRATION
 # ==========================================
 if __name__ == "__main__":
     async def main():
+        """
+        Primary asynchronous entry point. Bootstraps brokers, initializes risk engines,
+        and launches the concurrent TaskGroup worker loops.
+        """
         env_mode = os.environ.get("BOT_ENV", "simulation").lower()
         
         if env_mode in ["live", "paper"]:
@@ -56,10 +75,9 @@ if __name__ == "__main__":
             else:
                 logger.debug("Initializing PAPER TRADING Broker.")
                 broker = LiveKalshiBroker(key_id=key_id, private_key=private_key, paper_trade=True)
+            # Explicitly nullify references for immediate GC cleanup
             key_id = None
             private_key = None
-            del private_key
-            del key_id
             gc.collect()
         else:
             logger.debug("Initializing SIMULATION Broker.")
@@ -105,7 +123,7 @@ if __name__ == "__main__":
                     else:
                         tg.create_task(kalshi_websocket_consumer(engine), name="kalshi_consumer")
                 
-        except Exception as e:
+        except BaseException as e:
             log_exception_group(e)
         finally:
             logger.debug("Executing final engine shutdown protocols...")

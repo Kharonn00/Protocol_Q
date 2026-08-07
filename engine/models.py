@@ -1,34 +1,130 @@
+"""
+Kalshi Quantitative Trading Engine (KQTE) - Data Models & Indicator Fallbacks
+
+Defines type-safe financial primitives, Pydantic tick validators, state containers,
+and O(1) technical indicator mathematical fallbacks (Welford's variance algorithm,
+exponential moving averages, and Relative Strength Index computation).
+"""
+
 import re
+import math
 from decimal import Decimal, InvalidOperation
 from collections import deque
 from typing import Dict, Optional, Tuple, List, Set, Any
 from pydantic import BaseModel, Field, ValidationError
 
+import logging
+logger = logging.getLogger("KalshiQuantEngine")
+
 try:
     import kalshi_bot
 except ImportError:
+    logger.critical(
+        "[HARDENING] Native Rust 'kalshi_bot' C-extension failed to import! "
+        "Engaging Python fallback trackers. Strategy 4 (Index Lag) and Strategy 5 (OFI) will be INACTIVE."
+    )
     class PyFastIndicators:
-        def __init__(self, window_size: int, alpha: float):
-            self.window_size = window_size
-            self.alpha = alpha
+        """
+        O(1) Python Fallback Technical Indicator Processor.
+        Computes Exponential Moving Averages (EMA), Welford variance, Bollinger Bands,
+        and Relative Strength Index (RSI) when native Rust C-extension is unavailable.
+        """
+        def __init__(self, period: int, alpha: float):
+            self.period = period if period > 0 else 1
+            self.alpha = max(0.0, min(1.0, alpha))
             self.ema = 0.0
             self.var = 0.0
-            self.initialized = False
+            self.slow_ema = 0.0
+            self.slow_alpha = self.alpha / 5.0
+            self.count = 0
+            self.avg_gain = 0.0
+            self.avg_loss = 0.0
+            self.last_price = 0.0
 
         def add_price(self, price: float):
-            if not self.initialized:
+            if not math.isfinite(price): return
+            self.count += 1
+
+            if self.count == 1:
                 self.ema = price
-                self.initialized = True
+                self.slow_ema = price
+                self.var = 0.0
             else:
                 diff = price - self.ema
                 self.ema += self.alpha * diff
-                self.var = (1 - self.alpha) * (self.var + self.alpha * diff * diff)
+                self.var = (1.0 - self.alpha) * (self.var + self.alpha * diff * diff)
+                
+                slow_diff = price - self.slow_ema
+                self.slow_ema += self.slow_alpha * slow_diff
 
-        def add_price_with_volume(self, price: float, volume_k: float):
-            self.add_price(price)
+            if self.count > 1:
+                delta = price - self.last_price
+                current_gain = delta if delta > 0.0 else 0.0
+                current_loss = abs(delta) if delta < 0.0 else 0.0
+
+                if self.count <= self.period + 1:
+                    self.avg_gain += current_gain
+                    self.avg_loss += current_loss
+                    if self.count == self.period + 1:
+                        self.avg_gain /= float(self.period)
+                        self.avg_loss /= float(self.period)
+                else:
+                    p = float(self.period)
+                    self.avg_gain = (self.avg_gain * (p - 1.0) + current_gain) / p
+                    self.avg_loss = (self.avg_loss * (p - 1.0) + current_loss) / p
+
+            self.last_price = price
+
+        def add_price_with_volume(self, price: float, volume: float):
+            if not math.isfinite(price) or not math.isfinite(volume) or volume <= 0.0: return
+            vol_weight = min(3.0, math.log(1.0 + volume))
+            effective_alpha = min(0.99, self.alpha * vol_weight)
+            effective_slow_alpha = min(0.99, self.slow_alpha * vol_weight)
+
+            self.count += 1
+            if self.count == 1:
+                self.ema = price
+                self.slow_ema = price
+                self.var = 0.0
+            else:
+                diff = price - self.ema
+                self.ema += effective_alpha * diff
+                self.var = (1.0 - effective_alpha) * (self.var + effective_alpha * diff * diff)
+
+                slow_diff = price - self.slow_ema
+                self.slow_ema += effective_slow_alpha * slow_diff
+
+            if self.count > 1:
+                delta = price - self.last_price
+                current_gain = delta if delta > 0.0 else 0.0
+                current_loss = abs(delta) if delta < 0.0 else 0.0
+
+                if self.count <= self.period + 1:
+                    self.avg_gain += current_gain
+                    self.avg_loss += current_loss
+                    if self.count == self.period + 1:
+                        self.avg_gain /= float(self.period)
+                        self.avg_loss /= float(self.period)
+                else:
+                    p = float(self.period)
+                    self.avg_gain = (self.avg_gain * (p - 1.0) + current_gain) / p
+                    self.avg_loss = (self.avg_loss * (p - 1.0) + current_loss) / p
+
+            self.last_price = price
+
+        def get_trend_alignment(self) -> float:
+            return self.ema - self.slow_ema
+
+        def get_rsi(self) -> float:
+            if self.count < self.period + 1: return 50.0
+            if self.avg_gain == 0.0 and self.avg_loss == 0.0: return 50.0
+            if self.avg_loss == 0.0: return 100.0
+            rs = self.avg_gain / self.avg_loss
+            rsi = 100.0 - (100.0 / (1.0 + rs))
+            return 50.0 if math.isnan(rsi) else rsi
 
         def get_bollinger_bands(self) -> Tuple[float, float, float]:
-            std_dev = (self.var ** 0.5) if self.var > 0 else 0.0
+            std_dev = (self.var ** 0.5) if self.var > 0.0 else 0.0
             return self.ema, self.ema + 2.0 * std_dev, self.ema - 2.0 * std_dev
 
     class DummyIndexLagTracker:
@@ -87,7 +183,7 @@ def validate_tick_data(data: dict) -> Optional[dict]:
         if raw_vol is None:
             return None
         tick_volume = float(raw_vol)
-        if tick_volume <= 0.0:
+        if not math.isfinite(tick_volume) or tick_volume <= 0.0:
             return None
     except (ValueError, TypeError):
         return None
@@ -197,8 +293,8 @@ class PerformanceTracker:
         # Extract leading alpha characters (e.g. "BTC" from "BTC15M-26JUN...")
         match = re.match(r'^([A-Z]+)', clean)
         base = match.group(1) if match else clean
-        # Map to known ticker symbols to prevent partial matches like "BTCM"
-        for known in self._KNOWN_BASES:
+        # Map to known ticker symbols to prevent partial matches like "BTCM", sorting by length descending for deterministic longest-prefix match
+        for known in sorted(self._KNOWN_BASES, key=len, reverse=True):
             if base.startswith(known):
                 return known
         return base
@@ -206,10 +302,12 @@ class PerformanceTracker:
     def record(self, asset: str, hour: int, won: bool, pnl: float):
         key = (self._clean_asset(asset), hour)
         if key not in self.outcomes:
-            # SEC-29: Cap total tracked keys to prevent unbounded growth, enforcing O(1) space invariant
+            # Cap total tracked keys to prevent unbounded growth, preserving core active asset histories
             if len(self.outcomes) >= 200:
-                oldest_key = next(iter(self.outcomes))
-                del self.outcomes[oldest_key]
+                # Evict non-core assets first, or the least active key
+                non_core_keys = [k for k in self.outcomes if k[0] not in self._KNOWN_BASES]
+                evict_key = non_core_keys[0] if non_core_keys else min(self.outcomes.keys(), key=lambda k: len(self.outcomes[k]))
+                self.outcomes.pop(evict_key, None)
             self.outcomes[key] = deque(maxlen=20)
         self.outcomes[key].append(won)
 
@@ -225,15 +323,21 @@ class PerformanceTracker:
 # TYPE-SAFE FINANCIAL PARSING
 # ==========================================
 def safe_decimal(val, default_val: str = "0.00") -> Decimal:
-    """Safely converts input to Decimal, avoiding runtime type crashes."""
+    """Safely converts input to Decimal, avoiding runtime type crashes and NaN/Inf poisoning."""
     if val is None:
         return Decimal(default_val)
     if type(val) is Decimal:
+        if val.is_nan() or val.is_infinite():
+            return Decimal(default_val)
         return val
     try:
         if type(val) is float:
-            return Decimal(str(val)) # Required for floats to prevent IEEE 754 drift
-        return Decimal(val) # Natively handles strings and integers with 0 allocations
+            res = Decimal(str(val)) # Required for floats to prevent IEEE 754 drift
+        else:
+            res = Decimal(val) # Natively handles strings and integers with 0 allocations
+        if res.is_nan() or res.is_infinite():
+            return Decimal(default_val)
+        return res
     except (ValueError, TypeError, InvalidOperation):
         return Decimal(default_val)
 

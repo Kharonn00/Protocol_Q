@@ -1,3 +1,11 @@
+"""
+Kalshi Quantitative Trading Engine (KQTE) - Execution Brokers & Cryptographic Auth
+
+Defines the `ExecutionBroker` abstract base class, offline `SimExecutionBroker`,
+and production `LiveKalshiBroker`. Implements RSA-2048 SHA-256 PSS REST signature
+generation, orderbook depth parsing, paper trading fill matching engine, and position tracking.
+"""
+
 import os
 import time
 import base64
@@ -9,6 +17,7 @@ import orjson
 import uuid
 import gc
 import datetime
+from functools import lru_cache
 from decimal import Decimal, InvalidOperation
 from typing import Dict, Optional, Tuple, List, Set, Any
 from abc import ABC, abstractmethod
@@ -20,6 +29,21 @@ from engine.models import safe_decimal, safe_int
 from engine.security import SafeResolver, sanitize_log_str
 
 logger = logging.getLogger("KalshiQuantEngine")
+
+@lru_cache(maxsize=512)
+def _parse_subtitle_strike(subtitle: str) -> float:
+    """Optimized cached subtitle strike parsing to eliminate regex allocations in hot loops."""
+    if not subtitle: return 0.0
+    try:
+        dollar_numbers = DOLLAR_STRIKE_RE.findall(subtitle)
+        if dollar_numbers:
+            return float(dollar_numbers[-1].replace(',', ''))
+        numbers = GENERIC_NUMBER_RE.findall(subtitle)
+        if numbers:
+            return float(numbers[0].replace(',', ''))
+    except Exception:
+        pass
+    return 0.0
 
 # ==========================================
 # INTERFACE: Execution Contract
@@ -123,6 +147,8 @@ class SimExecutionBroker(ExecutionBroker):
             self.positions[key] = self.positions.get(key, 0) + quantity
             return order_id
         elif action.lower() == "sell":
+            if self.positions.get(key, 0) <= 0:
+                return None
             self.simulated_balance += total_value
             new_qty = max(0, self.positions.get(key, 0) - quantity)
             if new_qty <= 0:
@@ -365,20 +391,7 @@ class LiveKalshiBroker(ExecutionBroker):
                             strike_val = float(strike_val)
                         else:
                             subtitle = market.get("subtitle", "")
-                            try:
-                                # Match numbers preceded by a dollar sign first
-                                dollar_numbers = DOLLAR_STRIKE_RE.findall(subtitle)
-                                if dollar_numbers:
-                                    strike_val = float(dollar_numbers[-1].replace(',', ''))
-                                else:
-                                    # Fallback to general numbers if no dollar signs are present (take the first number as the strike)
-                                    numbers = GENERIC_NUMBER_RE.findall(subtitle)
-                                    if numbers:
-                                        strike_val = float(numbers[0].replace(',', ''))
-                                    else:
-                                        strike_val = 0.0
-                            except Exception:
-                                strike_val = 0.0
+                            strike_val = _parse_subtitle_strike(subtitle)
                                 
                         if base_asset == "DOGE" and strike_val > 1.0:
                             strike_val = strike_val / 100.0
@@ -425,25 +438,47 @@ class LiveKalshiBroker(ExecutionBroker):
                         no_bids = ob_fp.get("no_dollars", [])
                         valid_yes_bids = [b for b in yes_bids if isinstance(b, (list, tuple)) and len(b) >= 2]
                         valid_no_bids = [b for b in no_bids if isinstance(b, (list, tuple)) and len(b) >= 2]
-                        if not valid_yes_bids or not valid_no_bids: return None
-                        yes_bids_sorted = sorted(valid_yes_bids, key=lambda x: safe_decimal(x[0]))
-                        no_bids_sorted = sorted(valid_no_bids, key=lambda x: safe_decimal(x[0]))
-                        best_yes_bid = safe_decimal(yes_bids_sorted[-1][0])
-                        best_yes_qty = safe_int(yes_bids_sorted[-1][1])
-                        best_no_bid = safe_decimal(no_bids_sorted[-1][0])
-                        best_no_qty = safe_int(no_bids_sorted[-1][1])
+                        if side.lower() == "yes" and not valid_yes_bids: return None
+                        if side.lower() == "no" and not valid_no_bids: return None
+                        
+                        if valid_yes_bids:
+                            yes_bids_sorted = sorted(valid_yes_bids, key=lambda x: safe_decimal(x[0]))
+                            best_yes_bid = safe_decimal(yes_bids_sorted[-1][0])
+                            best_yes_qty = safe_int(yes_bids_sorted[-1][1])
+                        else:
+                            best_yes_bid = Decimal("0.01")
+                            best_yes_qty = 1
+
+                        if valid_no_bids:
+                            no_bids_sorted = sorted(valid_no_bids, key=lambda x: safe_decimal(x[0]))
+                            best_no_bid = safe_decimal(no_bids_sorted[-1][0])
+                            best_no_qty = safe_int(no_bids_sorted[-1][1])
+                        else:
+                            best_no_bid = Decimal("0.01")
+                            best_no_qty = 1
                     elif ob_standard:
                         yes_bids = ob_standard.get("yes", [])
                         no_bids = ob_standard.get("no", [])
                         valid_yes_bids = [b for b in yes_bids if isinstance(b, (list, tuple)) and len(b) >= 2]
                         valid_no_bids = [b for b in no_bids if isinstance(b, (list, tuple)) and len(b) >= 2]
-                        if not valid_yes_bids or not valid_no_bids: return None
-                        yes_bids_sorted = sorted(valid_yes_bids, key=lambda x: safe_decimal(x[0]))
-                        no_bids_sorted = sorted(valid_no_bids, key=lambda x: safe_decimal(x[0]))
-                        best_yes_bid = safe_decimal(yes_bids_sorted[-1][0]) / Decimal("100.00")
-                        best_yes_qty = safe_int(yes_bids_sorted[-1][1])
-                        best_no_bid = safe_decimal(no_bids_sorted[-1][0]) / Decimal("100.00")
-                        best_no_qty = safe_int(no_bids_sorted[-1][1])
+                        if side.lower() == "yes" and not valid_yes_bids: return None
+                        if side.lower() == "no" and not valid_no_bids: return None
+                        
+                        if valid_yes_bids:
+                            yes_bids_sorted = sorted(valid_yes_bids, key=lambda x: safe_decimal(x[0]))
+                            best_yes_bid = safe_decimal(yes_bids_sorted[-1][0]) / Decimal("100.00")
+                            best_yes_qty = safe_int(yes_bids_sorted[-1][1])
+                        else:
+                            best_yes_bid = Decimal("0.01")
+                            best_yes_qty = 1
+
+                        if valid_no_bids:
+                            no_bids_sorted = sorted(valid_no_bids, key=lambda x: safe_decimal(x[0]))
+                            best_no_bid = safe_decimal(no_bids_sorted[-1][0]) / Decimal("100.00")
+                            best_no_qty = safe_int(no_bids_sorted[-1][1])
+                        else:
+                            best_no_bid = Decimal("0.01")
+                            best_no_qty = 1
                     else: return None
                     
                     if side.lower() == "yes": 
@@ -549,7 +584,7 @@ class LiveKalshiBroker(ExecutionBroker):
                             order_data["filled_quantity"] += new_fills
                             order_data["total_cost"] += actual_cost
                             self._paper_balance += (limit_price * Decimal(new_fills)) - actual_cost
-                            if cached_best_vals is not None:
+                            if isinstance(cached_best_vals, list) and len(cached_best_vals) >= 4:
                                 cached_best_vals[3] = max(0, cached_best_vals[3] - new_fills)
                             logger.warning(f"[PAPER BROKER PARTIAL] BUY fill: {new_fills}x {contract_id} '{side.upper()}' @ ${slippage_price:.2f} (Total: {order_data['filled_quantity']}/{quantity}, Fee: ${Decimal(new_fills)*fee_rate:.4f})")
                     elif action == "sell" and best_bid >= limit_price:
@@ -562,7 +597,7 @@ class LiveKalshiBroker(ExecutionBroker):
                             
                             order_data["filled_quantity"] += new_fills
                             order_data["total_cost"] += actual_proceeds
-                            if cached_best_vals is not None:
+                            if isinstance(cached_best_vals, list) and len(cached_best_vals) >= 3:
                                 cached_best_vals[2] = max(0, cached_best_vals[2] - new_fills)
                             self._paper_balance += actual_proceeds
                             logger.warning(f"[PAPER BROKER PARTIAL] SELL fill: {new_fills}x {contract_id} '{side.upper()}' @ ${slippage_price:.2f} (Total: {order_data['filled_quantity']}/{quantity}, Fee: ${Decimal(new_fills)*fee_rate:.4f})")
@@ -703,11 +738,11 @@ class LiveKalshiBroker(ExecutionBroker):
                         return None
                     self._paper_balance -= total_trade_value
                     
-                if len(self._paper_orders) >= 10000:
+                if len(self._paper_orders) >= 500:
                     stale_keys = [k for k in self._paper_orders
                                   if self._paper_orders[k].get("status") in ("executed", "canceled")]
                     if stale_keys:
-                        for sk in stale_keys[:100]:
+                        for sk in stale_keys[:200]:
                             del self._paper_orders[sk]
                     else:
                         oldest_key = next(iter(self._paper_orders))

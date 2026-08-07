@@ -11,6 +11,8 @@
 *.pfx
 kalshi-key.pem
 monte_carlo_test.py
+stress_simulation_test.py
+tick_replay_test.py
 
 # Python & Build Cache
 __pycache__/

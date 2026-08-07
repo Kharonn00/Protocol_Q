@@ -1,5 +1,14 @@
+//! Native Rust PyO3 C-Extension Module (`kalshi_bot`)
+//!
+//! Provides zero-allocation, O(1) space/time complexity quantitative technical indicators:
+//! - `FastIndicators`: Welford variance, dual EMA smoothing, Bollinger Bands, RSI.
+//! - `IndexLagTracker`: 60-second rolling settlement index average & spot divergence tracker.
+//! - `TakerOrderFlowTracker`: 30-second executed trade tape order flow imbalance (OFI) tracker.
+
 use pyo3::prelude::*;
 
+/// High-Performance O(1) Technical Indicator Engine.
+/// Uses Welford's algorithm for numerically stable online variance calculation.
 #[pyclass]
 pub struct FastIndicators {
     alpha: f64,
@@ -21,6 +30,7 @@ pub struct FastIndicators {
 #[pymethods]
 impl FastIndicators {
     #[new]
+    #[pyo3(signature = (period=14, alpha=0.015))]
     pub fn new(period: usize, alpha: f64) -> Self {
         let period = if period == 0 { 1 } else { period };
         let clamped_alpha = alpha.clamp(0.0, 1.0);
@@ -45,20 +55,17 @@ impl FastIndicators {
 
         self.count += 1;
 
-        if self.mean == 0.0 {
+        if self.count == 1 {
             self.mean = price;
+            self.slow_mean = price;
             self.variance = 0.0;
         } else {
             let delta = price - self.mean;
             self.mean += self.alpha * delta;
             self.variance = (1.0 - self.alpha) * (self.variance + self.alpha * delta * delta);
-        }
 
-        // Slow EMA update
-        let slow_delta = price - self.slow_mean;
-        if self.slow_mean == 0.0 {
-            self.slow_mean = price;
-        } else {
+            // Slow EMA update
+            let slow_delta = price - self.slow_mean;
             self.slow_mean += self.slow_alpha * slow_delta;
         }
 
@@ -94,21 +101,18 @@ impl FastIndicators {
 
         self.count += 1;
 
-        if self.mean == 0.0 {
+        if self.count == 1 {
             self.mean = price;
+            self.slow_mean = price;
             self.variance = 0.0;
         } else {
             let delta = price - self.mean;
             self.mean += effective_alpha * delta;
             self.variance = (1.0 - effective_alpha) * (self.variance + effective_alpha * delta * delta);
-        }
 
-        // Slow EMA update (volume-weighted)
-        let effective_slow_alpha = (self.slow_alpha * vol_weight).min(0.99);
-        let slow_delta = price - self.slow_mean;
-        if self.slow_mean == 0.0 {
-            self.slow_mean = price;
-        } else {
+            // Slow EMA update (volume-weighted)
+            let effective_slow_alpha = (self.slow_alpha * vol_weight).min(0.99);
+            let slow_delta = price - self.slow_mean;
             self.slow_mean += effective_slow_alpha * slow_delta;
         }
 
@@ -190,9 +194,9 @@ impl IndexLagTracker {
     pub fn add_tick(&mut self, timestamp: f64, price: f64) {
         if !price.is_finite() || !timestamp.is_finite() || price <= 0.0 { return; }
 
-        // SEV-3: Reject out-of-order timestamps to prevent queue traps
+        // SEV-3: Reject out-of-order or extreme future timestamps to prevent queue traps
         if let Some(&(last_ts, _)) = self.ticks.back() {
-            if timestamp < last_ts { return; }
+            if timestamp < last_ts || timestamp - last_ts > 120.0 { return; }
         }
 
         self.insert_count += 1;
@@ -273,9 +277,9 @@ impl TakerOrderFlowTracker {
     pub fn add_trade(&mut self, timestamp: f64, volume_notional: f64, is_buy: bool) {
         if !volume_notional.is_finite() || volume_notional <= 0.0 || !timestamp.is_finite() { return; }
 
-        // SEV-3: Reject out-of-order timestamps to prevent queue traps
+        // SEV-3: Reject out-of-order or extreme future timestamps to prevent queue traps
         if let Some(&(last_ts, _, _)) = self.trades.back() {
-            if timestamp < last_ts { return; }
+            if timestamp < last_ts || timestamp - last_ts > 120.0 { return; }
         }
 
         self.insert_count += 1;
@@ -384,9 +388,9 @@ impl TakerOrderFlowTracker {
             }
         } else {
             self.last_ofi_side = current_side.clone();
-            self.ofi_persistence_count = 1;
+            self.ofi_persistence_count = 0;
             self.last_ofi_check_time = timestamp;
-            is_transition = true;
+            is_transition = false;
         }
         
         (self.last_ofi_side.clone(), self.ofi_persistence_count, is_transition)

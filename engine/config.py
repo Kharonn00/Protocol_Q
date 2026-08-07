@@ -1,3 +1,11 @@
+"""
+Kalshi Quantitative Trading Engine (KQTE) - System Configuration & Invariants
+
+Defines 12-factor environment variables, global security constants, and
+bounds-validated risk management parameters. Environment variables are read
+once during initial module load to enforce immutable runtime invariants.
+"""
+
 import os
 import re
 import ssl
@@ -8,6 +16,10 @@ from typing import Dict
 
 @dataclass
 class BotConfig:
+    """
+    Immutable System Risk & Strategy Parameter Registry.
+    Loads settings from OS environment variables with strict post-initialization bounds checking.
+    """
     MAX_CONCURRENT_TRADES: int = 2
     TRADE_BUDGET_PCT: Decimal = Decimal(os.environ.get("TRADE_BUDGET_PCT", "0.03"))
     MAX_CONTRACTS_PER_TRADE: int = 100
@@ -24,8 +36,18 @@ class BotConfig:
         "DOGE-USD": Decimal(os.environ.get("BINANCE_LIQ_THRESHOLD_DOGE", "300000.0"))
     })
     MAX_ALLOWED_SPREAD: Decimal = Decimal(os.environ.get("MAX_ALLOWED_SPREAD", "0.18"))
+    MIN_ENTRY_PRICE_YES: Decimal = Decimal(os.environ.get("MIN_ENTRY_PRICE_YES", "0.35"))
     MAX_ENTRY_PRICE_YES: Decimal = Decimal(os.environ.get("MAX_ENTRY_PRICE_YES", "0.55"))
-    MAX_ENTRY_PRICE_NO: Decimal = Decimal(os.environ.get("MAX_ENTRY_PRICE_NO", "0.65"))
+    MIN_ENTRY_PRICE_NO: Decimal = Decimal(os.environ.get("MIN_ENTRY_PRICE_NO", "0.35"))
+    MAX_ENTRY_PRICE_NO: Decimal = Decimal(os.environ.get("MAX_ENTRY_PRICE_NO", "0.55"))
+
+    # Execution Time Windows (seconds remaining in 15m contract)
+    STRATEGY_1_MIN_SECONDS_LEFT: float = float(os.environ.get("STRATEGY_1_MIN_SECONDS_LEFT", "300.0"))
+    STRATEGY_1_MAX_SECONDS_LEFT: float = float(os.environ.get("STRATEGY_1_MAX_SECONDS_LEFT", "720.0"))
+    STRATEGY_4_MIN_SECONDS_LEFT: float = float(os.environ.get("STRATEGY_4_MIN_SECONDS_LEFT", "240.0"))
+    STRATEGY_4_MAX_SECONDS_LEFT: float = float(os.environ.get("STRATEGY_4_MAX_SECONDS_LEFT", "480.0"))
+    STRATEGY_5_MIN_SECONDS_LEFT: float = float(os.environ.get("STRATEGY_5_MIN_SECONDS_LEFT", "240.0"))
+    STRATEGY_5_MAX_SECONDS_LEFT: float = float(os.environ.get("STRATEGY_5_MAX_SECONDS_LEFT", "540.0"))
 
     # Paper trading cost parameters
     PAPER_SLIPPAGE: Decimal = Decimal(os.environ.get("PAPER_SLIPPAGE", "0.01"))
@@ -58,11 +80,13 @@ class BotConfig:
     # Strategy 4: Index Lag Arbitrage Config
     ENABLE_INDEX_LAG_STRATEGY: bool = os.environ.get("ENABLE_INDEX_LAG_STRATEGY", "true").lower() == "true"
     INDEX_LAG_MIN_DIVERGENCE: Decimal = Decimal(os.environ.get("INDEX_LAG_MIN_DIVERGENCE", "0.0012"))
+    INDEX_LAG_MIN_DIVERGENCE_ETH: Decimal = Decimal(os.environ.get("INDEX_LAG_MIN_DIVERGENCE_ETH", "0.0025"))
 
     # Strategy 5: Taker Order Flow Imbalance (OFI) Config
     ENABLE_OFI_STRATEGY: bool = os.environ.get("ENABLE_OFI_STRATEGY", "true").lower() == "true"
     OFI_BUY_SELL_RATIO: Decimal = Decimal(os.environ.get("OFI_BUY_SELL_RATIO", "3.5"))
     OFI_MIN_VOLUME_NOTIONAL: Decimal = Decimal(os.environ.get("OFI_MIN_VOLUME_NOTIONAL", "50000.0"))
+    OFI_MIN_VOLUME_NOTIONAL_ETH: Decimal = Decimal(os.environ.get("OFI_MIN_VOLUME_NOTIONAL_ETH", "150000.0"))
     SIGNAL_EVAL_THROTTLE_SECS: float = float(os.environ.get("SIGNAL_EVAL_THROTTLE_SECS", "2.0"))
 
     def __post_init__(self):
@@ -77,10 +101,14 @@ class BotConfig:
             raise ValueError(f"LOCKOUT_AFTER_SEC={self.LOCKOUT_AFTER_SEC} out of safe range [0, 7200]")
         if not (Decimal("0.01") <= self.MAX_ALLOWED_SPREAD <= Decimal("0.50")):
             raise ValueError(f"MAX_ALLOWED_SPREAD={self.MAX_ALLOWED_SPREAD} out of safe range [0.01, 0.50]")
-        if not (Decimal("0.10") <= self.MAX_ENTRY_PRICE_YES <= Decimal("0.60")):
-            raise ValueError(f"MAX_ENTRY_PRICE_YES={self.MAX_ENTRY_PRICE_YES} out of safe range [0.10, 0.60]")
-        if not (Decimal("0.10") <= self.MAX_ENTRY_PRICE_NO <= Decimal("0.75")):
-            raise ValueError(f"MAX_ENTRY_PRICE_NO={self.MAX_ENTRY_PRICE_NO} out of safe range [0.10, 0.75]")
+        if not (Decimal("0.10") <= self.MIN_ENTRY_PRICE_YES <= Decimal("0.65")):
+            raise ValueError(f"MIN_ENTRY_PRICE_YES={self.MIN_ENTRY_PRICE_YES} out of safe range [0.10, 0.65]")
+        if not (Decimal("0.10") <= self.MAX_ENTRY_PRICE_YES <= Decimal("0.65")):
+            raise ValueError(f"MAX_ENTRY_PRICE_YES={self.MAX_ENTRY_PRICE_YES} out of safe range [0.10, 0.65]")
+        if not (Decimal("0.10") <= self.MIN_ENTRY_PRICE_NO <= Decimal("0.65")):
+            raise ValueError(f"MIN_ENTRY_PRICE_NO={self.MIN_ENTRY_PRICE_NO} out of safe range [0.10, 0.65]")
+        if not (Decimal("0.10") <= self.MAX_ENTRY_PRICE_NO <= Decimal("0.65")):
+            raise ValueError(f"MAX_ENTRY_PRICE_NO={self.MAX_ENTRY_PRICE_NO} out of safe range [0.10, 0.65]")
         if not (Decimal("0.00") <= self.PAPER_SLIPPAGE <= Decimal("0.05")):
             raise ValueError(f"PAPER_SLIPPAGE={self.PAPER_SLIPPAGE} out of safe range [0.00, 0.05]")
         if not (Decimal("0.00") <= self.PAPER_TAKER_FEE <= Decimal("0.02")):
@@ -93,6 +121,18 @@ class BotConfig:
             raise ValueError(f"OFI_MIN_VOLUME_NOTIONAL={self.OFI_MIN_VOLUME_NOTIONAL} out of safe range [1000, 10000000]")
         if not (0.1 <= self.SIGNAL_EVAL_THROTTLE_SECS <= 60.0):
             raise ValueError(f"SIGNAL_EVAL_THROTTLE_SECS={self.SIGNAL_EVAL_THROTTLE_SECS} out of safe range [0.1, 60.0]")
+        if not (Decimal("1.05") <= self.MIN_TP_ROI <= Decimal("3.00")):
+            raise ValueError(f"MIN_TP_ROI={self.MIN_TP_ROI} out of safe range [1.05, 3.00]")
+        if not (Decimal("1.10") <= self.MAX_TP_ROI <= Decimal("5.00")):
+            raise ValueError(f"MAX_TP_ROI={self.MAX_TP_ROI} out of safe range [1.10, 5.00]")
+        if not (1 <= self.MAX_CONCURRENT_TRADES <= 20):
+            raise ValueError(f"MAX_CONCURRENT_TRADES={self.MAX_CONCURRENT_TRADES} out of safe range [1, 20]")
+        if not (1 <= self.MAX_CONTRACTS_PER_TRADE <= 1000):
+            raise ValueError(f"MAX_CONTRACTS_PER_TRADE={self.MAX_CONTRACTS_PER_TRADE} out of safe range [1, 1000]")
+        if not (1 <= self.MAX_EXPOSURE_PER_EVENT <= 1000):
+            raise ValueError(f"MAX_EXPOSURE_PER_EVENT={self.MAX_EXPOSURE_PER_EVENT} out of safe range [1, 1000]")
+        if not (10.0 <= self.STALE_BALANCE_TIMEOUT_SEC <= 3600.0):
+            raise ValueError(f"STALE_BALANCE_TIMEOUT_SEC={self.STALE_BALANCE_TIMEOUT_SEC} out of safe range [10.0, 3600.0]")
         for asset, floor_val in self.STD_DEV_FLOORS_PCT.items():
             if not (0.0 <= floor_val <= 1.0):
                 raise ValueError(f"STD_DEV_FLOORS_PCT[{asset}]={floor_val} out of safe range [0.0, 1.0]")
