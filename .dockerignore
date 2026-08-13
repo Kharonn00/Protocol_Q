@@ -2,17 +2,13 @@
 .git/
 .gitignore
 
-# Environment Variables & Secrets
+# Secrets & Credentials
 .env
 *.env
 *.pem
 *.key
 *.p12
 *.pfx
-kalshi-key.pem
-monte_carlo_test.py
-stress_simulation_test.py
-tick_replay_test.py
 
 # Python & Build Cache
 __pycache__/
@@ -29,23 +25,26 @@ CACHEDIR.TAG
 venv/
 env/
 
-# Local Logs & Trading Data (CRITICAL TO IGNORE)
-trades.jsonl
+# Logs & Data
 *.log
+*.jsonl
 
 # IDE Configurations
 .idea/
 .vscode/
 
-# Documentation
+# Documentation (not needed in container)
 README*
 *.md
+LICENSE
+CONTRIBUTING.md
 
-# Gemini CLI
-GEMINI.md
-*.skill
+# Tests
+*_test.py
+tests/
 
-# Folders
+# Development Tools
 scratch/
 .gemini/
+*.skill
 security-engineer/

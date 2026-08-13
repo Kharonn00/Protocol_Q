@@ -1,9 +1,9 @@
 """
-Kalshi Quantitative Trading Engine (KQTE) - System Configuration & Invariants
+Kalshi Quantitative Trading Engine (KQTE) - System Configuration
 
-Defines 12-factor environment variables, global security constants, and
-bounds-validated risk management parameters. Environment variables are read
-once during initial module load to enforce immutable runtime invariants.
+This module loads all trading parameters from environment variables.
+It validates parameter bounds at startup to prevent unsafe configurations.
+All values are read once during module import and do not change at runtime.
 """
 
 import os

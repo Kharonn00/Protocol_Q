@@ -81,17 +81,17 @@ python -m py_compile kalshi_main.py engine/*.py
 
 ```bash
 # 1. Authenticate to AWS ECR
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com
+aws ecr get-login-password --region <REGION> | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com
 
 # 2. Build Cross-Platform Docker Image
 docker build --platform linux/amd64 -t kalshi-quant-engine .
 
 # 3. Tag and Push to ECR Repository
-docker tag kalshi-quant-engine:latest <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/kalshi-quant-engine:latest
-docker push <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/kalshi-quant-engine:latest
+docker tag kalshi-quant-engine:latest <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/kalshi-quant-engine:latest
+docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/kalshi-quant-engine:latest
 
 # 4. Trigger ECS Rolling Deployment
-aws ecs update-service --cluster QuantCluster --service kalshi-bot-service --force-new-deployment
+aws ecs update-service --cluster <CLUSTER_NAME> --service <SERVICE_NAME> --force-new-deployment
 ```
 
 ---
@@ -99,7 +99,11 @@ aws ecs update-service --cluster QuantCluster --service kalshi-bot-service --for
 ## 📜 License & Financial Disclaimer
 
 ### License
-Distributed under the **MIT License**.
+Distributed under the **MIT License**. See [`LICENSE`](LICENSE) for the full text.
+
+### Contributing
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development setup and contribution guidelines.
 
 ### Financial & Risk Disclaimer
 > **IMPORTANT**: This software is released strictly for educational, research, and open-source demonstration purposes. Quantitative trading in binary options and cryptocurrency derivatives carries substantial financial risk, including total loss of capital. Nothing in this repository constitutes financial, investment, legal, or tax advice. The authors and contributors accept no liability for financial losses incurred through the use or deployment of this software.
+

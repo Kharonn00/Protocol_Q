@@ -1,9 +1,9 @@
 """
-Kalshi Quantitative Trading Engine (KQTE) - Execution Brokers & Cryptographic Auth
+Kalshi Quantitative Trading Engine (KQTE) - Execution Brokers
 
-Defines the `ExecutionBroker` abstract base class, offline `SimExecutionBroker`,
-and production `LiveKalshiBroker`. Implements RSA-2048 SHA-256 PSS REST signature
-generation, orderbook depth parsing, paper trading fill matching engine, and position tracking.
+This module defines the broker abstraction layer for order execution.
+It includes a simulation broker for paper trading and a live broker
+that authenticates to the Kalshi REST API using RSA-2048 PSS signatures.
 """
 
 import os

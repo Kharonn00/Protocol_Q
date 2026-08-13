@@ -1,9 +1,9 @@
 """
-Kalshi Quantitative Trading Engine (KQTE) - Zero-Trust Security & Circuit Breaker
+Kalshi Quantitative Trading Engine (KQTE) - Security & Circuit Breaker
 
-Implements socket-level Server-Side Request Forgery (SSRF) defense (`SafeResolver`),
-DNS rebinding prevention, log injection sanitization (CWE-117), AWS Secret Manager
-retrieval with in-memory scrubbing, Macro Economic Circuit Breaker lockouts, and rate-limited HTTP health probes.
+This module provides network security utilities and trading safety controls.
+It includes SSRF/DNS rebinding protection, log injection sanitization,
+a macroeconomic event circuit breaker, and rate-limited health check endpoints.
 """
 
 import os

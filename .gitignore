@@ -87,13 +87,10 @@ CACHEDIR.TAG
 *.p12
 *.pfx
 
-# Gemini CLI
+# Internal Development Files
 GEMINI.md
-*.md
 *.skill
-monte_carlo_test.py
-stress_simulation_test.py
-tick_replay_test.py
+*_test.py
 
 # Folders
 scratch/

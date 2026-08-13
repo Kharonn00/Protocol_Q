@@ -1,14 +1,13 @@
 """
-Kalshi Quantitative Trading Engine (KQTE) - Strategy Engine & Execution Pipeline
+Kalshi Quantitative Trading Engine (KQTE) - Strategy Engine
 
-Implements the `LiveTradingEngine` daemon, Double-Checked Locking (DCL) state synchronization,
-atomic `execution_in_flight` contract tracking, and 3 active algorithmic strategies:
+This module runs the main trading engine and executes three strategies:
 1. Binance Liquidation Sniper (Strategy 1)
-2. CF Benchmarks Index Lag Arbitrage (Strategy 4 - Rust FFI)
-3. Taker Order Flow Imbalance (Strategy 5 - Rust FFI)
+2. CF Benchmarks Index Lag Arbitrage (Strategy 4)
+3. Taker Order Flow Imbalance (Strategy 5)
 
-Also manages asynchronous WebSocket ingestion (Coinbase, Binance, Bybit, Hyperliquid, Kalshi),
-Take-Profit tranche laddering, and memory queue backpressure throttling.
+It also manages WebSocket data feeds from Coinbase, Binance, Bybit,
+Hyperliquid, and Kalshi, and handles Take-Profit exit scaling.
 """
 
 import os

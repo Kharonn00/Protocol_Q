@@ -194,7 +194,7 @@ impl IndexLagTracker {
     pub fn add_tick(&mut self, timestamp: f64, price: f64) {
         if !price.is_finite() || !timestamp.is_finite() || price <= 0.0 { return; }
 
-        // SEV-3: Reject out-of-order or extreme future timestamps to prevent queue traps
+        // Reject out-of-order or extreme future timestamps to prevent data corruption
         if let Some(&(last_ts, _)) = self.ticks.back() {
             if timestamp < last_ts || timestamp - last_ts > 120.0 { return; }
         }
@@ -203,7 +203,7 @@ impl IndexLagTracker {
         self.ticks.push_back((timestamp, price));
         self.sum_price += price;
 
-        // SEV-1: Hard capacity cap to enforce strict O(1) space invariant under tick floods
+        // Hard capacity cap. Enforces O(1) space usage under high tick volume.
         while self.ticks.len() > 5000 {
             if let Some((_, old_price)) = self.ticks.pop_front() {
                 self.sum_price -= old_price;
@@ -277,7 +277,7 @@ impl TakerOrderFlowTracker {
     pub fn add_trade(&mut self, timestamp: f64, volume_notional: f64, is_buy: bool) {
         if !volume_notional.is_finite() || volume_notional <= 0.0 || !timestamp.is_finite() { return; }
 
-        // SEV-3: Reject out-of-order or extreme future timestamps to prevent queue traps
+        // Reject out-of-order or extreme future timestamps to prevent data corruption
         if let Some(&(last_ts, _, _)) = self.trades.back() {
             if timestamp < last_ts || timestamp - last_ts > 120.0 { return; }
         }
@@ -290,7 +290,7 @@ impl TakerOrderFlowTracker {
             self.total_sell_vol += volume_notional;
         }
 
-        // SEV-1: Hard capacity cap to enforce strict O(1) space invariant under trade floods
+        // Hard capacity cap. Enforces O(1) space usage under high trade volume.
         while self.trades.len() > 5000 {
             if let Some((_, old_vol, old_is_buy)) = self.trades.pop_front() {
                 if old_is_buy {

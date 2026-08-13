@@ -1,9 +1,9 @@
 """
 Kalshi Quantitative Trading Engine (KQTE) - Data Models & Indicator Fallbacks
 
-Defines type-safe financial primitives, Pydantic tick validators, state containers,
-and O(1) technical indicator mathematical fallbacks (Welford's variance algorithm,
-exponential moving averages, and Relative Strength Index computation).
+This module defines data models, state containers, and validation functions.
+It includes Python fallback classes for the Rust technical indicators
+(Bollinger Bands, EMA, RSI) that activate when the native library is unavailable.
 """
 
 import re

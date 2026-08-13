@@ -3,6 +3,9 @@ name = "kalshi_bot"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+description = "O(1) technical indicators for Kalshi 15-minute crypto options trading"
+license = "MIT"
+repository = "https://github.com/Kharonn00/Protocol_Q"
 
 [lib]
 name = "kalshi_bot"

@@ -5,9 +5,15 @@ build-backend = "maturin"
 [project]
 name = "kalshi_bot"
 requires-python = ">=3.12"
+description = "High-frequency async trading engine for Kalshi 15-minute crypto options"
+license = {text = "MIT"}
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
+    "License :: OSI Approved :: MIT License",
 ]
 dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/Kharonn00/Protocol_Q"

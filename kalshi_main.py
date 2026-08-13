@@ -16,9 +16,9 @@ from engine import (
 """
 Kalshi Quantitative Trading Engine (KQTE) - Core Entry Point
 
-Orchestrates system startup, secret retrieval, 12-factor configuration,
-micro HTTP health monitoring, and asynchronous task lifecycle management.
-Uses Python 3.12+ TaskGroup for deterministic concurrent worker scheduling.
+This script starts the trading engine. It reads configuration from
+environment variables, retrieves API credentials, starts the health
+server, and launches all WebSocket consumer and worker tasks.
 """
 
 # Optimize Garbage Collection thresholds to reduce latency jitter in high-frequency trading loops
@@ -29,10 +29,10 @@ logger = logging.getLogger("KalshiQuantEngine")
 
 async def start_health_server() -> web.AppRunner:
     """
-    Launches an ephemeral, non-blocking aiohttp health server for AWS ECS Fargate health probes.
+    Starts a lightweight HTTP health server for container orchestrator probes.
     
     Returns:
-        web.AppRunner: Active web runner managing the /health endpoint.
+        web.AppRunner: The active web runner that manages the /health endpoint.
     """
     app = web.Application()
     app.router.add_get('/', handle_health_check)
@@ -58,13 +58,15 @@ gc.freeze()
 if __name__ == "__main__":
     async def main():
         """
-        Primary asynchronous entry point. Bootstraps brokers, initializes risk engines,
-        and launches the concurrent TaskGroup worker loops.
+        Main async entry point. Creates the broker, builds the trading engine,
+        and starts all concurrent worker tasks.
         """
         env_mode = os.environ.get("BOT_ENV", "simulation").lower()
         
         if env_mode in ["live", "paper"]:
-            key_id, private_key = get_kalshi_credentials("prod/kalshi/api-keys", region_name="us-east-1")
+            secret_name = os.environ.get("KALSHI_SECRET_NAME", "prod/kalshi/api-keys")
+            aws_region = os.environ.get("AWS_REGION", "us-east-1")
+            key_id, private_key = get_kalshi_credentials(secret_name, region_name=aws_region)
             if env_mode == "live":
                 confirm = os.environ.get("LIVE_TRADING_CONFIRM", "")
                 if confirm != "I_ACCEPT_FINANCIAL_RISK":
